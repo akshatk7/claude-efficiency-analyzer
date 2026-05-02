@@ -98,6 +98,17 @@ Note: longer retention means more disk use. The author's 30-day window is ~315 M
 
 Logs from other machines aren't included — these are local files only.
 
+## Privacy & Network Behavior
+
+This tool reads `~/.claude/projects/` and serves a dashboard at `http://127.0.0.1:8741`. That's it.
+
+- **No outbound network calls.** No telemetry, no analytics, no API requests, no error reporting.
+- **Local-only HTTP server.** The server binds to `127.0.0.1`, so it isn't reachable from your network or the internet — only from your own machine.
+- **Stdlib only.** No third-party dependencies, no `pip install`, no supply-chain surface.
+- **Read-only on your logs.** The tool never writes to or modifies `~/.claude/projects/`.
+
+You can verify any of this in `analyzer.py` — the only network code is `from http.server import HTTPServer` (the local dashboard) and `webbrowser.open()` (which opens the local URL in your default browser).
+
 ## Who Is This For?
 
 **API / Enterprise users** get the most value — cost estimates directly reflect what you're paying per token, so you can optimize spending.
