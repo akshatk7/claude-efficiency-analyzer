@@ -92,7 +92,7 @@ Early in a session, this is cheap. But by message 100+, Claude may be re-reading
 
 **Claude Code keeps local session logs for 30 days by default.** Older sessions auto-rotate. The dashboard tells you exactly what's available:
 
-> Logs cover **2026-04-02** to **2026-05-01** (28 active days across 30 calendar days, 130 session files). Claude Code keeps the last **30 days** locally by default — older sessions auto-rotate. Bump `cleanupPeriodDays` in `~/.claude/settings.json` if you want a longer history.
+> Logs cover **2026-03-15** to **2026-04-13** (28 active days across 30 calendar days, 130 session files). Claude Code keeps the last **30 days** locally by default — older sessions auto-rotate. Bump `cleanupPeriodDays` in `~/.claude/settings.json` if you want a longer history.
 
 If you want longer history, set `cleanupPeriodDays` in your Claude Code settings:
 
