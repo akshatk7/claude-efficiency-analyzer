@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.4.4 — 2026-05-02
+
+### Subagent sessions now counted
+
+- Old behavior: `load_all_sessions()` only globbed top-level `*.jsonl` under each project dir. Subagent invocations that write to `<project>/<parent-session-uuid>/subagents/*.jsonl` were silently invisible
+- Real-data impact: in the author's logs, 50 of 65 jsonl files lived in `subagents/` and contributed ~$50 of cost that wasn't appearing anywhere. Projects whose work was entirely subagent-driven (e.g. delegated research) showed zero cost
+- Fix: explicit second glob for `<project>/*/subagents/*.jsonl`. Each subagent file becomes its own session tagged with `is_subagent=True`. Cost, tokens, and tool calls are independent — not double-counted by the parent
+
 ## v1.4.3 — 2026-05-01
 
 Two small but meaningful fixes prompted by user inspection.

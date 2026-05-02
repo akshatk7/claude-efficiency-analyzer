@@ -650,6 +650,16 @@ def load_all_sessions():
             s = parse_session_file(fpath)
             if s:
                 s["project_dir"] = d
+                s["is_subagent"] = False
+                sessions.append(s)
+        # Subagent invocations write their own jsonl under
+        # <project>/<parent-session-uuid>/subagents/*.jsonl. Each contains
+        # independent token usage — must be counted, not skipped.
+        for fpath in glob.glob(os.path.join(d, "*", "subagents", "*.jsonl")):
+            s = parse_session_file(fpath)
+            if s:
+                s["project_dir"] = d
+                s["is_subagent"] = True
                 sessions.append(s)
     return sessions
 
