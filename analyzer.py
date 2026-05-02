@@ -4,35 +4,203 @@ Claude Code Efficiency Analyzer
 Reads your local Claude Code session logs and generates a usage + efficiency report.
 
 Usage:
-  python3 analyzer.py              # opens browser on port 8741
-  python3 analyzer.py --port 9000  # custom port
-  python3 analyzer.py --no-open    # don't auto-open browser
+  python3 analyzer.py                  # opens browser on port 8741
+  python3 analyzer.py --port 9000      # custom port
+  python3 analyzer.py --no-open        # don't auto-open browser
+  python3 analyzer.py --export OUT.json # write report JSON for the last 30 days and exit
+  python3 analyzer.py --days 30        # period for --export (default 30)
+  python3 analyzer.py --privacy        # redact paths/IDs in the dashboard by default
 """
 
 import argparse
 import glob
+import hashlib
 import json
 import os
+import random
+import re
 import webbrowser
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-# ── Pricing (USD per million tokens, March 2026) ─────────────────────────────
+# ── Pricing (USD per million tokens, May 2026) ───────────────────────────────
 # Source: https://platform.claude.com/docs/en/about-claude/pricing
-# Cache write = 1.25x base input (5-min ephemeral), cache read = 0.1x base input
+# 5m cache write = 1.25x base input. 1h cache write = 2x base input. Cache read = 0.1x base input.
+# 1M context window: standard pricing for Opus 4.6+ / Sonnet 4.6+.
 PRICING = {
-    "claude-opus-4-6":            {"input": 5.0,  "output": 25.0, "cache_read": 0.50, "cache_write": 6.25},
-    "claude-opus-4-5-20250918":   {"input": 5.0,  "output": 25.0, "cache_read": 0.50, "cache_write": 6.25},
-    "claude-sonnet-4-6":          {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_write": 3.75},
-    "claude-sonnet-4-5-20250929": {"input": 3.0,  "output": 15.0, "cache_read": 0.30, "cache_write": 3.75},
-    "claude-haiku-4-5-20251001":  {"input": 1.0,  "output": 5.0,  "cache_read": 0.10, "cache_write": 1.25},
+    "claude-opus-4-7":            {"input": 5.0, "output": 25.0, "cache_read": 0.50, "cache_write_5m": 6.25, "cache_write_1h": 10.0},
+    "claude-opus-4-6":            {"input": 5.0, "output": 25.0, "cache_read": 0.50, "cache_write_5m": 6.25, "cache_write_1h": 10.0},
+    "claude-opus-4-5-20250918":   {"input": 5.0, "output": 25.0, "cache_read": 0.50, "cache_write_5m": 6.25, "cache_write_1h": 10.0},
+    "claude-sonnet-4-6":          {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_write_5m": 3.75, "cache_write_1h": 6.0},
+    "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_write_5m": 3.75, "cache_write_1h": 6.0},
+    "claude-haiku-4-5-20251001":  {"input": 1.0, "output": 5.0,  "cache_read": 0.10, "cache_write_5m": 1.25, "cache_write_1h": 2.0},
 }
-FALLBACK_PRICING = {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_write": 3.75}
+FALLBACK_PRICING = {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_write_5m": 3.75, "cache_write_1h": 6.0}
+
+WEB_SEARCH_PER_REQUEST = 10.0 / 1000  # $10 per 1,000 searches
+
+READ_TOOLS = {"Read", "Grep", "Glob", "WebFetch", "WebSearch"}
+WRITE_TOOLS = {"Edit", "Write", "NotebookEdit"}
+EXPLORE_TOOLS = {"Read", "Grep", "Glob", "Bash", "WebSearch", "WebFetch"}
+
+FRIENDLY_MCP = {
+    "playwright::browser_take_screenshot": "Browser screenshots",
+    "playwright::browser_navigate": "Browser navigation",
+    "playwright::browser_snapshot": "Browser snapshots",
+    "granola::get_meeting_transcript": "Meeting transcripts",
+    "granola::get_meetings": "Meeting notes",
+    "granola::list_meetings": "Meeting list",
+    "google-workspace::readGoogleDoc": "Google Doc reads",
+    "google-workspace::editGoogleDoc": "Google Doc edits",
+    "google-workspace::writeSpreadsheet": "Sheets writes",
+    "google-workspace::readSpreadsheet": "Sheets reads",
+    "google-workspace::listCalendarEvents": "Calendar lookups",
+    "google-workspace::listRecentFiles": "Drive listing",
+    "google-workspace::searchDrive": "Drive search",
+    "figma::get_screenshot": "Figma screenshots",
+    "figma::get_design_context": "Figma designs",
+    "figma::get_metadata": "Figma metadata",
+    "snowflake::run_snowflake_query": "Snowflake queries",
+    "snowflake::list_objects": "Snowflake schema",
+    "snowflake::describe_object": "Snowflake describe",
+    "slack::slack_read_thread": "Slack threads",
+    "slack::slack_search_public": "Slack search",
+    "slack::slack_search_public_and_private": "Slack search",
+    "slack::slack_send_message": "Slack messages",
+    "glean_default::read_document": "Glean documents",
+    "glean_default::search": "Glean search",
+}
+
+FRIENDLY_BUILTIN = {
+    "Read": "Read file",
+    "Write": "Write file",
+    "Edit": "Edit file",
+    "Bash": "Shell command",
+    "Grep": "Grep search",
+    "Glob": "Glob match",
+    "WebFetch": "Fetch URL",
+    "WebSearch": "Web search",
+    "Task": "Spawn subagent",
+    "Skill": "Run skill",
+    "TaskCreate": "Create task",
+    "TaskUpdate": "Update task",
+    "TaskList": "List tasks",
+    "TaskGet": "Get task",
+    "ExitPlanMode": "Exit plan mode",
+    "NotebookEdit": "Edit notebook",
+    "ToolSearch": "Tool lookup",
+    "Agent": "Spawn subagent",
+}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def friendly_tool_name(name):
+    if not name:
+        return "(text-only)"
+    if name in FRIENDLY_BUILTIN:
+        return FRIENDLY_BUILTIN[name]
+    short = name.replace("mcp__", "").replace("__", "::")
+    return FRIENDLY_MCP.get(short, short)
+
+
+def friendly_model_name(model):
+    if not model:
+        return "Unknown"
+    m = model.lower()
+    if "opus-4-7" in m: return "Opus 4.7"
+    if "opus-4-6" in m: return "Opus 4.6"
+    if "opus" in m:    return "Opus"
+    if "sonnet-4-6" in m: return "Sonnet 4.6"
+    if "sonnet" in m:  return "Sonnet"
+    if "haiku" in m:   return "Haiku"
+    return model.replace("claude-", "").replace(re.search(r"-20\d{6}$", model).group() if re.search(r"-20\d{6}$", model) else "", "")
+
+
+# ── Tier vocabulary (descriptive, not graded) ────────────────────────────────
+
+USAGE_BANDS = [(75, "Heavy"), (50, "Steady"), (25, "Light"), (0, "Sampling")]
+EFFICIENCY_BANDS = [(75, "High"), (50, "Solid"), (25, "Mixed"), (0, "Spotty")]
+COMPOSITE_BANDS = [(85, "Power Use"), (65, "Heavy Use"), (45, "Steady Use"), (25, "Light Use"), (0, "Just Starting")]
+
+
+def _band(score, bands):
+    for threshold, label in bands:
+        if score >= threshold:
+            return label
+    return bands[-1][1]
+
+
+# ── Pricing lookups ──────────────────────────────────────────────────────────
+
+def get_pricing(model):
+    if not model:
+        return FALLBACK_PRICING
+    if model in PRICING:
+        return PRICING[model]
+    for key in sorted(PRICING.keys(), key=len, reverse=True):
+        if key in model:
+            return PRICING[key]
+    ml = model.lower()
+    if "opus" in ml:   return PRICING["claude-opus-4-7"]
+    if "sonnet" in ml: return PRICING["claude-sonnet-4-6"]
+    if "haiku" in ml:  return PRICING["claude-haiku-4-5-20251001"]
+    return FALLBACK_PRICING
+
+
+def cost_components(model, usage):
+    p = get_pricing(model)
+    inp = usage.get("input_tokens", 0) or 0
+    out = usage.get("output_tokens", 0) or 0
+    cr = usage.get("cache_read_input_tokens", 0) or 0
+    cc_total = usage.get("cache_creation_input_tokens", 0) or 0
+
+    cc = usage.get("cache_creation") or {}
+    cc_5m = cc.get("ephemeral_5m_input_tokens", 0) or 0
+    cc_1h = cc.get("ephemeral_1h_input_tokens", 0) or 0
+    if cc_5m == 0 and cc_1h == 0 and cc_total > 0:
+        cc_5m = cc_total
+
+    server = usage.get("server_tool_use") or {}
+    web_search_n = server.get("web_search_requests", 0) or 0
+
+    return {
+        "input":          (inp / 1e6) * p["input"],
+        "output":         (out / 1e6) * p["output"],
+        "cache_read":     (cr / 1e6) * p["cache_read"],
+        "cache_write_5m": (cc_5m / 1e6) * p["cache_write_5m"],
+        "cache_write_1h": (cc_1h / 1e6) * p["cache_write_1h"],
+        "web_search":     web_search_n * WEB_SEARCH_PER_REQUEST,
+        "_tokens": {
+            "input": inp, "output": out, "cache_read": cr,
+            "cache_write_5m": cc_5m, "cache_write_1h": cc_1h,
+            "web_search_requests": web_search_n,
+        },
+    }
+
+
+def total_cost(comp):
+    return comp["input"] + comp["output"] + comp["cache_read"] + comp["cache_write_5m"] + comp["cache_write_1h"] + comp["web_search"]
+
+
+def dominant_cost_driver(comp):
+    """Which of {cache_read, cache_write, output, input, web_search} dominated this turn?"""
+    cw = comp["cache_write_5m"] + comp["cache_write_1h"]
+    parts = [
+        ("cache_read", comp["cache_read"]),
+        ("cache_write", cw),
+        ("output", comp["output"]),
+        ("input", comp["input"]),
+        ("web_search", comp["web_search"]),
+    ]
+    parts.sort(key=lambda x: -x[1])
+    return parts[0][0] if parts[0][1] > 0 else "input"
+
+
+# ── Project discovery (memoized) ──────────────────────────────────────────────
+
+_project_name_cache = {}
+
 
 def find_project_dirs():
     home = os.path.expanduser("~")
@@ -43,16 +211,10 @@ def find_project_dirs():
 
 
 def project_name_from_dir(dirpath):
-    """Extract a human-readable project name from a .claude/projects/ directory.
-
-    Directory names encode the cwd: /Users/me/Projects/foo → -Users-me-Projects-foo
-    We read the first user record's cwd to get the real path, then shorten it.
-    Falls back to parsing the directory name if no cwd is found.
-    """
-    # Try to read actual cwd from the first session file
+    if dirpath in _project_name_cache:
+        return _project_name_cache[dirpath]
     cwd = None
-    jsonl_files = glob.glob(os.path.join(dirpath, "*.jsonl"))
-    for fpath in jsonl_files[:3]:  # check up to 3 files
+    for fpath in glob.glob(os.path.join(dirpath, "*.jsonl"))[:3]:
         try:
             with open(fpath) as f:
                 for line in f:
@@ -70,138 +232,343 @@ def project_name_from_dir(dirpath):
                 break
         except Exception:
             continue
+    name = _format_project_name(cwd, dirpath)
+    _project_name_cache[dirpath] = name
+    return name
 
+
+def _format_project_name(cwd, dirpath):
+    home = os.path.expanduser("~")
     if not cwd:
-        # Fallback: reconstruct path from dirname by matching against known home prefix
         dirname = os.path.basename(dirpath).lstrip("-")
-        home = os.path.expanduser("~")
-        # The dirname encoding replaces both / and . with -
-        # e.g. /Users/akshat.khandelwal/Desktop/foo → Users-akshat-khandelwal-Desktop-foo
         home_encoded = home.lstrip("/").replace("/", "-").replace(".", "-")
         if dirname == home_encoded:
             return "~ (home)"
         if dirname.startswith(home_encoded + "-"):
-            rel = dirname[len(home_encoded) + 1:]  # e.g. Desktop-ai-native-pms
-            return "~/" + rel
+            return "~/" + dirname[len(home_encoded) + 1:]
         return dirname
-
-    home = os.path.expanduser("~")
     if cwd.rstrip("/") == home.rstrip("/"):
         return "~ (home)"
-    if cwd.startswith(home + "/"):
-        rel = cwd[len(home) + 1:]  # e.g. Projects/my-app
-    else:
-        rel = cwd
-
-    # Show the last meaningful path segments
+    rel = cwd[len(home) + 1:] if cwd.startswith(home + "/") else cwd
     parts = [p for p in rel.split("/") if p]
     if not parts:
         return "~ (home)"
-
-    # If path starts with common parent dirs, keep the project name + one level of context
     generic = {"Desktop", "Documents", "Projects", "repos", "src", "code", "dev", "work", "workspace"}
-    # Find first non-generic component
     for i, p in enumerate(parts):
         if p not in generic:
-            # Include one parent for context if it's generic (e.g. "Projects/my-app")
             if i > 0 and parts[i - 1] in generic:
                 return "/".join(parts[i - 1:])
             return "/".join(parts[i:])
-    # All parts are generic — show the last one
     return parts[-1]
 
 
-def get_pricing(model):
-    if not model:
-        return FALLBACK_PRICING
-    for key, p in PRICING.items():
-        if key in model or model in key:
-            return p
-    ml = (model or "").lower()
-    if "opus" in ml: return PRICING["claude-opus-4-6"]
-    if "sonnet" in ml: return PRICING.get("claude-sonnet-4-6", FALLBACK_PRICING)
-    if "haiku" in ml: return PRICING.get("claude-haiku-4-5-20251001", FALLBACK_PRICING)
-    return FALLBACK_PRICING
+# ── Session label + categorization ───────────────────────────────────────────
+
+CATEGORY_KEYWORDS = {
+    "Data Analysis": ["sql", "snowflake", "query", "metric", "edw", "table_", "select ", "group by", "data analysis", "pull data"],
+    "PM Work": ["meeting", "digest", "morning sync", "weekly", "prep ", "leadership", "stakeholder", "update doc", "brief", "prd"],
+    "Design Work": ["figma", "design", "prototype", "mockup", "wireframe", "ui ", "ux "],
+    "Debugging": ["debug", "fix ", "broken", "error", "stack trace", "why is", "why does", "investigate"],
+    "Writing": ["write a", "draft", "compose", "rewrite", "edit doc", "blog", "post about"],
+    "Research": ["research", "look into", "what is", "explain how", "compare", "summarize"],
+    "Coding": ["refactor", "implement", "build a", "add a feature", "rename ", "test ", "lint ", "code review"],
+}
 
 
-def cost_of(model, usage):
-    p = get_pricing(model)
-    return (
-        (usage.get("input_tokens", 0) / 1e6) * p["input"]
-        + (usage.get("output_tokens", 0) / 1e6) * p["output"]
-        + (usage.get("cache_read_input_tokens", 0) / 1e6) * p["cache_read"]
-        + (usage.get("cache_creation_input_tokens", 0) / 1e6) * p["cache_write"]
-    )
+def categorize_session(session, first_prompt):
+    text = (first_prompt or "").lower()[:2000]
+    tools = session["tool_calls"]
+    write_n = session["writes"]
+    read_n = session["reads"]
+    mcp_n = session["mcp_calls"]
+
+    snow_n = sum(c for t, c in tools.items() if "snowflake" in t.lower())
+    granola_n = sum(c for t, c in tools.items() if "granola" in t.lower())
+    slack_n = sum(c for t, c in tools.items() if "slack" in t.lower())
+    gws_n = sum(c for t, c in tools.items() if "google" in t.lower() or "workspace" in t.lower())
+    figma_n = sum(c for t, c in tools.items() if "figma" in t.lower())
+    glean_n = sum(c for t, c in tools.items() if "glean" in t.lower())
+
+    # Strong tool-based signals first
+    if snow_n >= 3:
+        return "Data Analysis"
+    if figma_n >= 2:
+        return "Design Work"
+    if granola_n >= 2 or slack_n >= 5 or gws_n >= 5:
+        return "PM Work"
+    if write_n >= 5 and (read_n / max(write_n, 1)) <= 5 and mcp_n < 5:
+        return "Coding"
+
+    # Keyword-based fallbacks
+    for cat, keywords in CATEGORY_KEYWORDS.items():
+        if any(k in text for k in keywords):
+            return cat
+
+    # Final shape-based fallbacks
+    if glean_n >= 2 or (read_n >= 5 and write_n == 0):
+        return "Research"
+    if write_n >= 3:
+        return "Coding"
+    return "Other"
 
 
-# ── Scanning ──────────────────────────────────────────────────────────────────
+def extract_session_label(first_prompt, session_id):
+    if not first_prompt:
+        return f"session {session_id[:8] if session_id else '?'}"
+    label = re.sub(r"\s+", " ", first_prompt).strip()
+    # Strip common Claude Code system-injected prefixes.
+    for prefix in ["<system-reminder>", "<command-name>", "[Request interrupted"]:
+        if label.startswith(prefix):
+            label = label.split(">", 1)[-1].strip() if ">" in label else label
+    if len(label) > 80:
+        label = label[:77].rstrip() + "…"
+    return label or f"session {session_id[:8] if session_id else '?'}"
 
-def scan_availability():
-    """Quick scan to find date range and active dates across all logs."""
-    dirs = find_project_dirs()
-    files = []
-    for d in dirs:
-        files.extend(glob.glob(os.path.join(d, "*.jsonl")))
 
-    active_dates = set()
-    for fpath in files:
-        try:
-            with open(fpath) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        ts = rec.get("timestamp")
-                        if ts and (rec.get("type") in ("user", "assistant")):
-                            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
-                            active_dates.add(str(dt))
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-        except Exception:
-            continue
+# ── Single-pass parsing ──────────────────────────────────────────────────────
 
-    if not active_dates:
-        return {"first_date": None, "last_date": None, "active_dates": [], "total_files": len(files)}
-
-    sorted_dates = sorted(active_dates)
+def _new_session():
     return {
-        "first_date": sorted_dates[0],
-        "last_date": sorted_dates[-1],
-        "active_dates": sorted_dates,
-        "total_files": len(files),
-    }
-
-
-def parse_session(filepath, date_from, date_to):
-    session = {
         "session_id": None,
+        "project_dir": None,
+        "label": None,
+        "category": "Other",
+        "first_prompt": None,
         "messages_user": 0, "messages_assistant": 0,
-        "tokens_input": 0, "tokens_output": 0,
-        "tokens_cache_read": 0, "tokens_cache_create": 0,
-        "cost_usd": 0.0,
+        "tokens": defaultdict(int),
+        "cost": defaultdict(float),
+        "cost_total": 0.0,
         "tool_calls": defaultdict(int),
-        "model_tokens": defaultdict(int),
-        "model_cost": defaultdict(float),
+        "by_model_tokens": defaultdict(int),
+        "by_model_cost": defaultdict(float),
+        "by_date": defaultdict(lambda: {"tokens": 0, "cost": 0.0, "msgs": 0}),
         "timestamps": [],
-        "daily": defaultdict(lambda: {"tokens": 0, "cost": 0.0, "msgs": 0}),
-        # Efficiency signals
         "reads": 0, "writes": 0, "mcp_calls": 0, "interrupts": 0,
         "mcp_tools": defaultdict(int),
-        "mcp_tokens": 0, "mcp_tool_tokens": defaultdict(int),
-        "repeated_reads": defaultdict(int),  # file_path -> count
+        "mcp_tokens": 0,
+        "mcp_tool_tokens": defaultdict(int),
+        "read_signatures": defaultdict(int),
         "max_agent_streak": 0, "_cur_streak": 0,
         "short_prompts": 0, "detailed_prompts": 0, "total_prompts": 0,
-        "subagent_spawns": 0,
+        "subagent_spawns": 0, "skill_invocations": 0,
+        "skills_used": defaultdict(int),
+        "plan_mode_uses": 0,
+        "truncated_turns": 0,
+        "sidechain_cost": 0.0, "sidechain_tokens": 0,
+        "per_turn_cache_read": [],
+        "per_turn_cost": [],
+        "_assistant_idx": 0,
+        "_pending_tool_chars": [],
+        "duration_min": 0,
+        "opus_total_tokens": 0,
+        "opus_trivial_tokens": 0,
     }
-    in_range = False
+
+
+def _classify_assistant_content(content_blocks):
+    tools = []
+    out_chars = 0
+    for blk in content_blocks or []:
+        if not isinstance(blk, dict):
+            continue
+        if blk.get("type") == "tool_use":
+            tools.append(blk.get("name", "unknown"))
+        elif blk.get("type") == "text":
+            out_chars += len(blk.get("text", ""))
+    return tools, out_chars
+
+
+def _parse_user_message(rec, sess):
+    sess["messages_user"] += 1
+    sess["_cur_streak"] = 0
+    msg = rec.get("message", {}) or {}
+    content = msg.get("content", "")
+    prompt_len = 0
+    prompt_text = ""
+
+    if isinstance(content, str):
+        prompt_len = len(content)
+        prompt_text = content
+        if "interrupted" in content.lower():
+            sess["interrupts"] += 1
+    elif isinstance(content, list):
+        for blk in content:
+            if not isinstance(blk, dict):
+                continue
+            btype = blk.get("type")
+            if btype == "text":
+                t = blk.get("text", "")
+                prompt_len += len(t)
+                prompt_text += t + " "
+                if "interrupted" in t.lower():
+                    sess["interrupts"] += 1
+            elif btype == "tool_result":
+                rc = blk.get("content", "")
+                if isinstance(rc, str):
+                    chars = len(rc)
+                elif isinstance(rc, list):
+                    chars = sum(len(str(b)) for b in rc)
+                else:
+                    chars = len(str(rc))
+                sess["_pending_tool_chars"].append((blk.get("tool_use_id", ""), chars))
+
+    if prompt_len > 0:
+        sess["total_prompts"] += 1
+        if prompt_len < 20:
+            sess["short_prompts"] += 1
+        elif prompt_len > 500:
+            sess["detailed_prompts"] += 1
+
+    # First substantive user prompt becomes the session label seed.
+    if prompt_text.strip() and not sess["first_prompt"] and not rec.get("isMeta"):
+        # Skip system-injected stuff.
+        clean = prompt_text.strip()
+        if not clean.startswith("<") and not clean.startswith("[Request interrupted"):
+            sess["first_prompt"] = clean
+
+
+def _parse_assistant_message(rec, sess, recent_tool_uses):
+    sess["messages_assistant"] += 1
+    sess["_cur_streak"] += 1
+    sess["max_agent_streak"] = max(sess["max_agent_streak"], sess["_cur_streak"])
+    sess["_assistant_idx"] += 1
+    turn_idx = sess["_assistant_idx"]
+
+    msg = rec.get("message", {}) or {}
+    usage = msg.get("usage", {}) or {}
+    model = msg.get("model", "unknown")
+    stop_reason = msg.get("stop_reason", "")
+
+    if stop_reason == "max_tokens":
+        sess["truncated_turns"] += 1
+
+    comp = cost_components(model, usage)
+    c = total_cost(comp)
+    sess["cost_total"] += c
+    for k in ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h", "web_search"):
+        sess["cost"][k] += comp[k]
+    tk = comp["_tokens"]
+    for k, v in tk.items():
+        sess["tokens"][k] += v
+    ttok = tk["input"] + tk["output"] + tk["cache_read"] + tk["cache_write_5m"] + tk["cache_write_1h"]
+    sess["by_model_tokens"][model] += ttok
+    sess["by_model_cost"][model] += c
+    sess["per_turn_cache_read"].append((turn_idx, tk["cache_read"]))
+
+    if rec.get("isSidechain"):
+        sess["sidechain_cost"] += c
+        sess["sidechain_tokens"] += ttok
+
+    content = msg.get("content", []) or []
+    tools_in_turn, out_chars = _classify_assistant_content(content)
+    is_only_explore = bool(tools_in_turn) and all(t in EXPLORE_TOOLS for t in tools_in_turn)
+    is_trivial_explore = is_only_explore and tk["output"] < 200
+    if "opus" in (model or "").lower():
+        sess["opus_total_tokens"] += ttok
+        if is_trivial_explore:
+            sess["opus_trivial_tokens"] += ttok
+
+    top_tool = None
+    for blk in content:
+        if not isinstance(blk, dict):
+            continue
+        if blk.get("type") == "tool_use":
+            name = blk.get("name", "unknown")
+            sess["tool_calls"][name] += 1
+            top_tool = top_tool or name
+            if name in READ_TOOLS:
+                sess["reads"] += 1
+            elif name in WRITE_TOOLS:
+                sess["writes"] += 1
+            if "mcp__" in name:
+                sess["mcp_calls"] += 1
+                sess["mcp_tools"][name] += 1
+                recent_tool_uses[blk.get("id", "")] = name
+            if name == "Read":
+                inp_args = blk.get("input") or {}
+                if isinstance(inp_args, dict):
+                    sig = (inp_args.get("file_path", ""),
+                           inp_args.get("offset", None),
+                           inp_args.get("limit", None))
+                    if sig[0]:
+                        sess["read_signatures"][sig] += 1
+            if name in ("Task", "Agent"):
+                sess["subagent_spawns"] += 1
+            if name == "Skill":
+                sess["skill_invocations"] += 1
+                inp_args = blk.get("input") or {}
+                skill = inp_args.get("skill", "unknown") if isinstance(inp_args, dict) else "unknown"
+                sess["skills_used"][skill] += 1
+            if name == "ExitPlanMode":
+                sess["plan_mode_uses"] += 1
+
+    sess["per_turn_cost"].append({
+        "idx": turn_idx, "cost": c, "model": model,
+        "tool": top_tool or "(text-only)",
+        "ts": rec.get("timestamp", ""),
+        "session_id": sess["session_id"],
+        "cache_read": tk["cache_read"],
+        "output": tk["output"],
+        "cache_write": tk["cache_write_5m"] + tk["cache_write_1h"],
+        "driver": dominant_cost_driver(comp),
+    })
+
+    pending = sess["_pending_tool_chars"]
+    if pending:
+        total_pending_chars = sum(c for _, c in pending) or 1
+        new_cache = tk["cache_write_5m"] + tk["cache_write_1h"]
+        attributable = int(new_cache * 0.85)
+        for tool_id, chars in pending:
+            tool_name = recent_tool_uses.get(tool_id)
+            if not tool_name or "mcp__" not in tool_name:
+                continue
+            share = int(attributable * (chars / total_pending_chars))
+            fallback = chars // 3
+            est = max(share, fallback)
+            sess["mcp_tokens"] += est
+            sess["mcp_tool_tokens"][tool_name] += est
+        sess["_pending_tool_chars"] = []
+
+    return c
+
+
+def _parse_record(rec, sess, recent_tool_uses):
+    rtype = rec.get("type")
+    ts_str = rec.get("timestamp")
     cur_day = None
-    _last_tool = None
 
-    READ_TOOLS = {"Read", "Grep", "Glob", "WebFetch", "WebSearch"}
-    WRITE_TOOLS = {"Edit", "Write", "NotebookEdit"}
+    if ts_str:
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            cur_day = str(ts.date())
+            sess["timestamps"].append(ts)
+            if not sess["session_id"]:
+                sess["session_id"] = rec.get("sessionId")
+        except (ValueError, TypeError):
+            pass
 
+    if rtype == "permission-mode" and rec.get("permissionMode") == "plan":
+        sess["plan_mode_uses"] += 1
+        return
+
+    if rtype == "user":
+        if cur_day:
+            sess["by_date"][cur_day]["msgs"] += 1
+        _parse_user_message(rec, sess)
+    elif rtype == "assistant":
+        c = _parse_assistant_message(rec, sess, recent_tool_uses)
+        if cur_day:
+            tk = rec.get("message", {}).get("usage", {}) or {}
+            ttok = sum([tk.get("input_tokens", 0) or 0, tk.get("output_tokens", 0) or 0,
+                        tk.get("cache_read_input_tokens", 0) or 0, tk.get("cache_creation_input_tokens", 0) or 0])
+            sess["by_date"][cur_day]["tokens"] += ttok
+            sess["by_date"][cur_day]["cost"] += c
+            sess["by_date"][cur_day]["msgs"] += 1
+
+
+def parse_session_file(filepath):
+    sess = _new_session()
+    recent_tool_uses = {}
     try:
         with open(filepath) as f:
             for line in f:
@@ -212,345 +579,490 @@ def parse_session(filepath, date_from, date_to):
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-
-                rtype = rec.get("type")
-                ts_str = rec.get("timestamp")
-
-                if ts_str and not session["session_id"]:
-                    session["session_id"] = rec.get("sessionId")
-
-                if ts_str:
-                    try:
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        td = ts.date()
-                        if date_from and td < date_from:
-                            continue
-                        if date_to and td > date_to:
-                            continue
-                        in_range = True
-                        cur_day = str(td)
-                        session["timestamps"].append(ts)
-                    except (ValueError, TypeError):
-                        pass
-
-                if rtype == "user":
-                    session["messages_user"] += 1
-                    session["_cur_streak"] = 0  # reset agent streak
-                    if cur_day:
-                        session["daily"][cur_day]["msgs"] += 1
-                    msg = rec.get("message", {})
-                    content = msg.get("content", "")
-                    # Track prompt length
-                    prompt_len = 0
-                    if isinstance(content, str):
-                        prompt_len = len(content)
-                    elif isinstance(content, list):
-                        for blk in content:
-                            if isinstance(blk, dict):
-                                if blk.get("type") == "text":
-                                    prompt_len += len(blk.get("text", ""))
-                                if "interrupted" in str(blk.get("text", "")).lower():
-                                    session["interrupts"] += 1
-                                if blk.get("type") == "tool_result":
-                                    rc = blk.get("content", "")
-                                    if isinstance(rc, str): sz = len(rc) // 4
-                                    elif isinstance(rc, list): sz = sum(len(str(b)) for b in rc) // 4
-                                    else: sz = len(str(rc)) // 4
-                                    if _last_tool and "mcp__" in _last_tool:
-                                        session["mcp_tokens"] += sz
-                                        session["mcp_tool_tokens"][_last_tool] += sz
-                    else:
-                        if isinstance(content, str) and "interrupted" in content.lower():
-                            session["interrupts"] += 1
-                    if prompt_len > 0:
-                        session["total_prompts"] += 1
-                        if prompt_len < 20:
-                            session["short_prompts"] += 1
-                        elif prompt_len > 500:
-                            session["detailed_prompts"] += 1
-
-                elif rtype == "assistant":
-                    session["messages_assistant"] += 1
-                    # Track agent streaks (consecutive Claude turns)
-                    session["_cur_streak"] += 1
-                    session["max_agent_streak"] = max(session["max_agent_streak"], session["_cur_streak"])
-
-                    msg = rec.get("message", {})
-                    usage = msg.get("usage", {})
-                    model = msg.get("model", "unknown")
-
-                    inp = usage.get("input_tokens", 0)
-                    out = usage.get("output_tokens", 0)
-                    cr = usage.get("cache_read_input_tokens", 0)
-                    cc = usage.get("cache_creation_input_tokens", 0)
-                    session["tokens_input"] += inp
-                    session["tokens_output"] += out
-                    session["tokens_cache_read"] += cr
-                    session["tokens_cache_create"] += cc
-
-                    c = cost_of(model, usage)
-                    session["cost_usd"] += c
-                    ttok = inp + out + cr + cc
-                    session["model_tokens"][model] += ttok
-                    session["model_cost"][model] += c
-
-                    if cur_day:
-                        session["daily"][cur_day]["tokens"] += ttok
-                        session["daily"][cur_day]["cost"] += c
-                        session["daily"][cur_day]["msgs"] += 1
-
-                    content = msg.get("content", [])
-                    if isinstance(content, list):
-                        for blk in content:
-                            if isinstance(blk, dict) and blk.get("type") == "tool_use":
-                                name = blk.get("name", "unknown")
-                                _last_tool = name
-                                session["tool_calls"][name] += 1
-                                if name in READ_TOOLS:
-                                    session["reads"] += 1
-                                elif name in WRITE_TOOLS:
-                                    session["writes"] += 1
-                                if "mcp__" in name:
-                                    session["mcp_calls"] += 1
-                                    session["mcp_tools"][name] += 1
-                                # Track repeated file reads
-                                if name == "Read":
-                                    fp = blk.get("input", {}).get("file_path", "") if isinstance(blk.get("input"), dict) else ""
-                                    if fp:
-                                        session["repeated_reads"][fp] += 1
-                                # Track subagent spawns
-                                if name == "Task":
-                                    session["subagent_spawns"] += 1
+                _parse_record(rec, sess, recent_tool_uses)
     except Exception:
         return None
 
-    if not in_range or session["messages_assistant"] == 0:
+    if sess["messages_assistant"] == 0:
         return None
-    if len(session["timestamps"]) >= 2:
-        session["duration_min"] = (max(session["timestamps"]) - min(session["timestamps"])).total_seconds() / 60
+    # Wall-clock span — useful for sorting "longest" sessions but misleading
+    # if a tab was left idle for hours. Kept for "Best Moments" context only.
+    if len(sess["timestamps"]) >= 2:
+        sess["span_min"] = (max(sess["timestamps"]) - min(sess["timestamps"])).total_seconds() / 60
     else:
-        session["duration_min"] = 0
+        sess["span_min"] = 0
+    # Focused active time — sum of gaps between consecutive timestamps capped at
+    # 5 minutes per gap. This filters out idle stretches (overnight, parallel tabs).
+    sorted_ts = sorted(sess["timestamps"])
+    focused = 0.0
+    for a, b in zip(sorted_ts, sorted_ts[1:]):
+        gap = (b - a).total_seconds() / 60
+        if 0 < gap <= 5:
+            focused += gap
+    sess["duration_min"] = focused
 
-    # Derived metrics
-    session["redundant_reads"] = sum(max(0, c - 1) for c in session["repeated_reads"].values())
-    session["short_prompt_pct"] = session["short_prompts"] / max(session["total_prompts"], 1)
+    sess["redundant_reads"] = sum(max(0, c - 1) for c in sess["read_signatures"].values())
+    sess["short_prompt_pct"] = sess["short_prompts"] / max(sess["total_prompts"], 1)
+    cr_per_turn = [c for _, c in sess["per_turn_cache_read"]]
+    sess["avg_cache_read_per_turn"] = sum(cr_per_turn) / len(cr_per_turn) if cr_per_turn else 0
+    sess["max_cache_read_per_turn"] = max(cr_per_turn) if cr_per_turn else 0
 
-    # Compute per-session flags
-    session["flags"] = []
-    if session["reads"] > 5 and session["writes"] == 0:
-        session["flags"].append("bulk-read-no-output")
-    if session["mcp_calls"] > 20:
-        session["flags"].append("mcp-heavy")
-    if session["messages_user"] < 3 and session["messages_assistant"] > 10:
-        session["flags"].append("low-interaction")
-    if session["interrupts"] > 2:
-        session["flags"].append("high-interrupts")
-    if session["max_agent_streak"] >= 8:
-        session["flags"].append("deep-agent-loop")
-    if session["redundant_reads"] > 5:
-        session["flags"].append("redundant-reads")
+    flags = []
+    if sess["reads"] > 5 and sess["writes"] == 0:
+        flags.append("bulk-read-no-output")
+    if sess["mcp_calls"] > 20:
+        flags.append("mcp-heavy")
+    if sess["messages_user"] < 3 and sess["messages_assistant"] > 10:
+        flags.append("low-interaction")
+    if sess["interrupts"] > 2:
+        flags.append("high-interrupts")
+    if sess["max_agent_streak"] >= 8:
+        flags.append("deep-agent-loop")
+    if sess["redundant_reads"] > 5:
+        flags.append("redundant-reads")
+    if sess["avg_cache_read_per_turn"] > 300_000:
+        flags.append("stale-context")
+    if sess["truncated_turns"] > max(2, sess["messages_assistant"] * 0.05):
+        flags.append("truncated-output")
+    sess["flags"] = flags
 
-    return session
+    sess["label"] = extract_session_label(sess["first_prompt"], sess["session_id"])
+    sess["category"] = categorize_session(sess, sess["first_prompt"])
+
+    if sess["timestamps"]:
+        sess["first_date"] = min(sess["timestamps"]).date()
+        sess["last_date"] = max(sess["timestamps"]).date()
+    else:
+        sess["first_date"] = None
+        sess["last_date"] = None
+
+    sess.pop("_cur_streak", None)
+    sess.pop("_pending_tool_chars", None)
+    sess.pop("_assistant_idx", None)
+    return sess
 
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
+def load_all_sessions():
+    dirs = find_project_dirs()
+    sessions = []
+    for d in dirs:
+        for fpath in glob.glob(os.path.join(d, "*.jsonl")):
+            s = parse_session_file(fpath)
+            if s:
+                s["project_dir"] = d
+                sessions.append(s)
+    return sessions
+
+
+def slice_sessions(all_sessions, date_from, date_to):
+    out = []
+    for s in all_sessions:
+        if not s.get("first_date") or not s.get("last_date"):
+            continue
+        if s["last_date"] < date_from or s["first_date"] > date_to:
+            continue
+        in_range_dates = [(d, dd) for d, dd in s["by_date"].items()
+                          if date_from <= datetime.fromisoformat(d).date() <= date_to]
+        if not in_range_dates:
+            continue
+        out.append((s, dict(in_range_dates)))
+    return out
+
+
+# ── Privacy redaction ────────────────────────────────────────────────────────
+
+def _hash_label(s, n=6):
+    return hashlib.sha256((s or "").encode()).hexdigest()[:n]
+
+
+def redact_obj(obj, project_aliases, session_aliases):
+    """Walk the report and replace identifiers with stable aliases."""
+    home = os.path.expanduser("~")
+    user = os.environ.get("USER", "user")
+
+    def rstr(s):
+        if not isinstance(s, str):
+            return s
+        s = s.replace(home, "~").replace("/Users/" + user, "~")
+        s = re.sub(r"/Users/[^/\s]+", "~", s)
+        # Replace UUIDs with aliases when known.
+        for sid, alias in session_aliases.items():
+            if sid and sid in s:
+                s = s.replace(sid, alias)
+        for path, alias in project_aliases.items():
+            if path and path in s:
+                s = s.replace(path, alias)
+        # Names aren't fully scrubbed (free text could contain anything) — that's by design.
+        return s
+
+    def walk(x):
+        if isinstance(x, dict):
+            return {k: walk(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [walk(v) for v in x]
+        if isinstance(x, str):
+            return rstr(x)
+        return x
+    return walk(obj)
+
+
+# ── Scoring ──────────────────────────────────────────────────────────────────
 
 def clamp(v, lo=0, hi=100):
     return max(lo, min(hi, v))
 
 
-def score_usage(sessions, num_days):
-    """Score 0-100 for how much you're using Claude Code."""
-    if num_days <= 0 or not sessions:
+def score_usage(sliced, num_days):
+    if num_days <= 0 or not sliced:
         return 0
-
-    active_days = len(set(str(d) for s in sessions for d in s["daily"].keys()))
-    total_msgs = sum(s["messages_user"] + s["messages_assistant"] for s in sessions)
-    total_sessions = len(sessions)
-
-    # Active days ratio (what % of days did you use Claude?)
+    active_days = len({d for s, dates in sliced for d in dates.keys()})
+    total_msgs = sum(s["messages_user"] + s["messages_assistant"] for s, _ in sliced)
+    total_sessions = len(sliced)
     day_ratio = active_days / num_days
-    day_score = clamp(day_ratio * 125)  # 80% active = 100
-
-    # Sessions per active day
+    day_score = clamp(day_ratio * 125)
     sess_per_day = total_sessions / max(active_days, 1)
-    if sess_per_day >= 4: sess_score = 100
-    elif sess_per_day >= 2: sess_score = 75
-    elif sess_per_day >= 1: sess_score = 55
-    else: sess_score = 30
-
-    # Messages per active day
+    sess_score = 100 if sess_per_day >= 4 else 75 if sess_per_day >= 2 else 55 if sess_per_day >= 1 else 30
     msgs_per_day = total_msgs / max(active_days, 1)
-    if msgs_per_day >= 100: msg_score = 100
-    elif msgs_per_day >= 50: msg_score = 80
-    elif msgs_per_day >= 20: msg_score = 60
-    elif msgs_per_day >= 5: msg_score = 35
-    else: msg_score = 15
-
+    msg_score = (100 if msgs_per_day >= 100 else 80 if msgs_per_day >= 50 else 60 if msgs_per_day >= 20
+                 else 35 if msgs_per_day >= 5 else 15)
     return clamp(round(day_score * 0.40 + sess_score * 0.30 + msg_score * 0.30))
 
 
-def score_efficiency(sessions):
-    """Score 0-100 for how efficiently you use Claude Code."""
-    if not sessions:
+def score_efficiency(sliced):
+    if not sliced:
         return 0
-
-    total_input = sum(s["tokens_input"] for s in sessions)
-    total_output = sum(s["tokens_output"] for s in sessions)
-    total_cr = sum(s["tokens_cache_read"] for s in sessions)
-    total_cc = sum(s["tokens_cache_create"] for s in sessions)
+    sessions = [s for s, _ in sliced]
+    total_input = sum(s["tokens"]["input"] for s in sessions)
+    total_output = sum(s["tokens"]["output"] for s in sessions)
+    total_cr = sum(s["tokens"]["cache_read"] for s in sessions)
+    total_cw = sum(s["tokens"]["cache_write_5m"] + s["tokens"]["cache_write_1h"] for s in sessions)
     total_asst = sum(s["messages_assistant"] for s in sessions)
     total_msgs = sum(s["messages_user"] + s["messages_assistant"] for s in sessions)
 
-    # 1. Cache hit rate (25%)
-    cache_denom = total_cr + total_cc + total_input
+    cache_denom = total_cr + total_cw + total_input
     cache_rate = total_cr / cache_denom if cache_denom > 0 else 0
-    if cache_rate >= 0.85: cache_score = 100
-    elif cache_rate >= 0.70: cache_score = 80
-    elif cache_rate >= 0.55: cache_score = 60
-    elif cache_rate >= 0.40: cache_score = 40
-    else: cache_score = 20
+    cache_score = (100 if cache_rate >= 0.90 else 80 if cache_rate >= 0.80 else 60 if cache_rate >= 0.65
+                   else 40 if cache_rate >= 0.50 else 20)
 
-    # 2. Messages per session — longer = better context amortization (15%)
     mps = total_msgs / len(sessions)
-    if mps >= 80: mps_score = 100
-    elif mps >= 40: mps_score = 80
-    elif mps >= 15: mps_score = 60
-    elif mps >= 5: mps_score = 35
-    else: mps_score = 15
+    mps_score = (100 if mps >= 80 else 80 if mps >= 40 else 60 if mps >= 15
+                 else 35 if mps >= 5 else 15)
 
-    # 3. Output tokens per message — leaner = better (15%)
     tpm = total_output / max(total_asst, 1)
-    if tpm <= 200: tpm_score = 100
-    elif tpm <= 500: tpm_score = 85
-    elif tpm <= 1500: tpm_score = 65
-    elif tpm <= 3000: tpm_score = 45
-    else: tpm_score = 25
+    tpm_score = (100 if tpm <= 200 else 85 if tpm <= 500 else 65 if tpm <= 1500
+                 else 45 if tpm <= 3000 else 25)
 
-    # 4. Model cost optimization (15%)
-    total_tok = total_input + total_output + total_cr + total_cc
-    model_tokens = defaultdict(int)
-    for s in sessions:
-        for m, t in s["model_tokens"].items():
-            model_tokens[m] += t
-    opus_tok = sum(t for m, t in model_tokens.items() if "opus" in m.lower())
-    opus_pct = opus_tok / total_tok if total_tok > 0 else 0
-    if opus_pct <= 0.3: model_score = 100
-    elif opus_pct <= 0.5: model_score = 80
-    elif opus_pct <= 0.7: model_score = 60
-    elif opus_pct <= 0.9: model_score = 40
-    else: model_score = 25
+    opus_total = sum(s.get("opus_total_tokens", 0) for s in sessions)
+    opus_trivial = sum(s.get("opus_trivial_tokens", 0) for s in sessions)
+    if opus_total > 0:
+        trivial_pct = opus_trivial / opus_total
+        task_fit_score = (100 if trivial_pct <= 0.10 else 85 if trivial_pct <= 0.20
+                          else 60 if trivial_pct <= 0.35 else 40 if trivial_pct <= 0.5 else 25)
+    else:
+        task_fit_score = 60
 
-    # 5. Read:Write ratio — producing output, not just consuming (15%)
     total_reads = sum(s["reads"] for s in sessions)
     total_writes = sum(s["writes"] for s in sessions)
     if total_writes == 0 and total_reads == 0:
-        rw_score = 50  # no tool use — neutral
+        rw_score = 50
     elif total_writes == 0:
-        rw_score = 20  # all reads, no output
+        rw_score = 20
     else:
         ratio = total_reads / total_writes
-        if ratio <= 4: rw_score = 100    # healthy balance
-        elif ratio <= 8: rw_score = 70   # read-heavy but some output
-        elif ratio <= 15: rw_score = 45  # very read-heavy
-        else: rw_score = 25             # almost pure consumption
+        rw_score = 100 if ratio <= 4 else 70 if ratio <= 8 else 45 if ratio <= 15 else 25
 
-    # 6. Session health — % of sessions without waste flags (15%)
     flagged = sum(1 for s in sessions if s.get("flags"))
-    clean_pct = 1 - (flagged / len(sessions))
-    health_score = clamp(round(clean_pct * 100))
+    health_score = clamp(round((1 - flagged / len(sessions)) * 100))
 
     return clamp(round(
         cache_score * 0.25 + mps_score * 0.15 + tpm_score * 0.15
-        + model_score * 0.15 + rw_score * 0.15 + health_score * 0.15
+        + task_fit_score * 0.15 + rw_score * 0.15 + health_score * 0.15
     ))
 
 
 def composite_score(usage, efficiency):
-    """Combine usage and efficiency — you need both to score well."""
     return clamp(round(usage * 0.40 + efficiency * 0.40 + min(usage, efficiency) * 0.20))
 
 
-def tier_label(score):
-    if score >= 90: return "Power User"
-    if score >= 75: return "Solid"
-    if score >= 60: return "Room to Grow"
-    if score >= 45: return "Under-utilizing"
-    if score >= 30: return "Needs Attention"
-    return "Getting Started"
+# ── Availability ────────────────────────────────────────────────────────────
+
+def read_cleanup_period():
+    """Read cleanupPeriodDays from ~/.claude/settings.json. Default is 30."""
+    path = os.path.expanduser("~/.claude/settings.json")
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+        val = settings.get("cleanupPeriodDays")
+        if isinstance(val, (int, float)) and val > 0:
+            return {"days": int(val), "is_default": False}
+    except Exception:
+        pass
+    return {"days": 30, "is_default": True}
 
 
-def usage_label(score):
-    if score >= 75: return ("High", "Using Claude Code regularly across your workflow")
-    if score >= 50: return ("Medium", "Moderate usage — room to integrate more")
-    if score >= 25: return ("Low", "Light usage — try it for more tasks")
-    return ("Very Low", "Barely using Claude Code")
-
-
-def efficiency_label(score):
-    if score >= 75: return ("High", "Strong cache reuse, lean responses, focused sessions")
-    if score >= 50: return ("Medium", "Decent efficiency — some room to optimize")
-    if score >= 25: return ("Low", "Burning more tokens than needed per task")
-    return ("Very Low", "Significant room to improve how you use Claude")
-
-
-def tier_desc(usage, efficiency):
-    u_level = "high" if usage >= 65 else "medium" if usage >= 35 else "low"
-    e_level = "high" if efficiency >= 65 else "medium" if efficiency >= 35 else "low"
-
-    descs = {
-        ("high", "high"): "You're using Claude Code frequently and efficiently. Keep it up.",
-        ("high", "medium"): "Strong usage but some efficiency gains available. Check the recommendations below.",
-        ("high", "low"): "You're using Claude Code a lot but not efficiently. Focus on the efficiency tips below — they'll save significant cost.",
-        ("medium", "high"): "When you use Claude Code, you use it well. Consider using it for more of your workflow to get full value.",
-        ("medium", "medium"): "Moderate usage and efficiency. Room to improve on both fronts.",
-        ("medium", "low"): "Moderate usage but low efficiency. Focus on the efficiency recommendations before increasing usage.",
-        ("low", "high"): "Efficient when you use it, but you're under-utilizing it. Try incorporating Claude Code into more of your daily work.",
-        ("low", "medium"): "Light usage with average efficiency. You have room to grow on both dimensions.",
-        ("low", "low"): "Just getting started. Try longer, more focused sessions and review the tips below.",
+def scan_availability(all_sessions):
+    active_dates = set()
+    for s in all_sessions:
+        active_dates.update(s["by_date"].keys())
+    if not active_dates:
+        return {"first_date": None, "last_date": None, "active_dates": [], "total_files": 0,
+                "retention": read_cleanup_period()}
+    sorted_dates = sorted(active_dates)
+    return {
+        "first_date": sorted_dates[0], "last_date": sorted_dates[-1],
+        "active_dates": sorted_dates, "total_files": len(all_sessions),
+        "retention": read_cleanup_period(),
     }
-    return descs.get((u_level, e_level), "")
 
 
-# ── Analysis ──────────────────────────────────────────────────────────────────
+# ── Top finding logic ────────────────────────────────────────────────────────
 
-def analyze(date_from, date_to):
-    dirs = find_project_dirs()
-    # Track which project each file belongs to
-    files = []
-    file_project = {}  # filepath -> project dir
-    for d in dirs:
-        for fpath in glob.glob(os.path.join(d, "*.jsonl")):
-            files.append(fpath)
-            file_project[fpath] = d
+def compute_top_finding(sessions, totals):
+    """Find the highest-impact concrete opportunity with $ savings estimate."""
+    candidates = []
 
-    sessions = []
-    for fpath in files:
-        s = parse_session(fpath, date_from, date_to)
-        if s:
-            s["_project_dir"] = file_project[fpath]
-            sessions.append(s)
+    # Stale-context savings.
+    stale_cost = sum(s["cost_total"] for s in sessions if "stale-context" in s.get("flags", []))
+    if stale_cost > totals["total_cost"] * 0.05:
+        savings = stale_cost * 0.4  # rough — clearing context would cut bloat substantially
+        candidates.append({
+            "kind": "stale_context",
+            "savings": savings,
+            "headline": f"Context bloat is costing ~${savings:.0f} this period",
+            "action": "Use /clear when switching tasks or start fresh sessions for unrelated work.",
+            "evidence": f"{len([s for s in sessions if 'stale-context' in s.get('flags',[])])} session(s) averaged >300K cache reads per turn.",
+        })
 
-    # Prior period
+    # Opus on trivial work.
+    opus_trivial_cost = 0
+    for s in sessions:
+        if s.get("opus_total_tokens", 0) > 0:
+            ratio = s["opus_trivial_tokens"] / s["opus_total_tokens"]
+            opus_trivial_cost += sum(c for m, c in s["by_model_cost"].items() if "opus" in m.lower()) * ratio
+    if opus_trivial_cost > totals["total_cost"] * 0.05:
+        savings = opus_trivial_cost * 0.6  # Sonnet is ~40% cost
+        candidates.append({
+            "kind": "opus_trivial",
+            "savings": savings,
+            "headline": f"Opus on trivial reads/searches costs ~${savings:.0f}",
+            "action": "For simple file lookups, Bash, or Grep-only turns, switch to Sonnet (~40% cheaper).",
+            "evidence": f"~${opus_trivial_cost:.0f} of Opus tokens went to read-only or Bash-only turns.",
+        })
+
+    # External services (MCP).
+    mcp_cost_est = totals["mcp_tokens"] * 6.25 / 1e6  # conservative cache-write rate
+    if mcp_cost_est > totals["total_cost"] * 0.10:
+        top_mcp = totals["mcp_heavy_tools"][:2]
+        savings = mcp_cost_est * 0.4  # request summaries instead of full content
+        names = ", ".join(FRIENDLY_MCP.get(n, n) for n, _ in top_mcp)
+        candidates.append({
+            "kind": "mcp_heavy",
+            "savings": savings,
+            "headline": f"External services pulled ~${mcp_cost_est:.0f} of tokens",
+            "action": f"Ask for summaries or specific ranges instead of full documents — especially {names}.",
+            "evidence": f"~{totals['mcp_tokens']//1000}K tokens of tool results across {totals['total_mcp']} calls.",
+        })
+
+    # Many short sessions.
+    avg_msgs = totals["total_messages"] / max(totals["sessions"], 1)
+    if avg_msgs < 5 and totals["sessions"] >= 5:
+        savings = totals["total_cost"] * 0.15  # rough — context rebuilding cost
+        candidates.append({
+            "kind": "short_sessions",
+            "savings": savings,
+            "headline": f"Many short sessions burn ~${savings:.0f} on rebuilt context",
+            "action": "Batch related tasks into one longer session — context gets re-loaded each time you start fresh.",
+            "evidence": f"Average {avg_msgs:.1f} messages per session across {totals['sessions']} sessions.",
+        })
+
+    # Vague prompts.
+    if totals["total_prompts"] > 0 and totals["short_prompts"] / totals["total_prompts"] > 0.20:
+        savings = totals["total_cost"] * 0.08
+        pct = totals["short_prompts"] / totals["total_prompts"]
+        candidates.append({
+            "kind": "vague_prompts",
+            "savings": savings,
+            "headline": f"Vague prompts may cost ~${savings:.0f} in re-tries",
+            "action": "Be specific upfront — file paths, expected output, constraints.",
+            "evidence": f"{pct:.0%} of your prompts were under 20 characters.",
+        })
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: -x["savings"])
+    return candidates[0]
+
+
+# ── Best moments ─────────────────────────────────────────────────────────────
+
+def compute_best_moments(sessions):
+    """Return up to 2 sessions that exemplify good usage."""
+    out = []
+    eligible = [s for s in sessions if s["messages_assistant"] >= 5 and not s.get("flags")]
+    if not eligible:
+        return out
+
+    # Longest deep-work session.
+    by_dur = sorted(eligible, key=lambda s: -s["duration_min"])
+    if by_dur and by_dur[0]["duration_min"] >= 30:
+        s = by_dur[0]
+        out.append({
+            "kind": "deep_work",
+            "title": "Longest clean session",
+            "label": s["label"], "session_id": s["session_id"],
+            "duration_min": s["duration_min"], "messages": s["messages_user"] + s["messages_assistant"],
+            "cost": s["cost_total"], "writes": s["writes"], "category": s["category"],
+        })
+
+    # Highest output-per-dollar (productivity proxy).
+    def yield_score(s):
+        return (s["writes"] * 5 + s["messages_assistant"]) / max(s["cost_total"], 0.01)
+    by_yield = sorted([s for s in eligible if s["cost_total"] > 0.50], key=lambda s: -yield_score(s))
+    if by_yield and (not out or by_yield[0]["session_id"] != out[0]["session_id"]):
+        s = by_yield[0]
+        out.append({
+            "kind": "high_yield",
+            "title": "Most productive session",
+            "label": s["label"], "session_id": s["session_id"],
+            "duration_min": s["duration_min"], "messages": s["messages_user"] + s["messages_assistant"],
+            "cost": s["cost_total"], "writes": s["writes"], "category": s["category"],
+        })
+
+    return out
+
+
+# ── Targets ──────────────────────────────────────────────────────────────────
+
+def compute_hero_headline(totals, cost_breakdown, hours, sessions, num_days):
+    """Pick one insight-shaped headline from a few candidates.
+
+    Each candidate is scored by how *striking* it is — bigger ratios, larger
+    numbers, sharper concentration. The most striking wins. Fallbacks to a
+    descriptive line if nothing is interesting.
+    """
+    cw = (cost_breakdown.get("cache_write_5m", 0) or 0) + (cost_breakdown.get("cache_write_1h", 0) or 0)
+    cr = cost_breakdown.get("cache_read", 0) or 0
+    out = cost_breakdown.get("output", 0) or 0
+    cache_total = cr + cw
+    total = totals["total_cost"]
+
+    candidates = []
+
+    # 1. Cache vs output framing.
+    if out > 0 and cache_total > out * 3:
+        ratio = cache_total / out
+        candidates.append({
+            "score": min(ratio / 3, 5),
+            "text": f"Cache reads and writes cost {ratio:.1f}× what Claude's actual responses cost (${cache_total:.0f} vs ${out:.0f}).",
+        })
+
+    # 2. Cache % of total spend.
+    if total > 0 and cache_total / total > 0.80:
+        pct = cache_total / total
+        candidates.append({
+            "score": pct * 4,
+            "text": f"{pct:.0%} of your spend goes to re-reading conversation history each turn — output and prompts are the cheap part.",
+        })
+
+    # 3. Concentration: top 5 sessions vs the rest.
+    sorted_costs = sorted([s["cost_total"] for s in sessions], reverse=True)
+    if len(sorted_costs) >= 10:
+        top5 = sum(sorted_costs[:5])
+        rest = sum(sorted_costs[5:])
+        if top5 > rest:
+            candidates.append({
+                "score": (top5 / max(rest, 0.01)) * 1.5,
+                "text": f"Your top 5 sessions cost more than the other {len(sorted_costs) - 5} combined (${top5:.0f} vs ${rest:.0f}).",
+            })
+
+    # 4. Hours framing — claude-as-percent-of-work-week.
+    if hours > 5 and num_days >= 7:
+        weeks = num_days / 7
+        hours_per_week = hours / weeks
+        if hours_per_week > 2:
+            pct_of_workweek = hours_per_week / 40
+            candidates.append({
+                "score": min(hours_per_week / 5, 4),
+                "text": f"You spent {hours:.0f} hours in Claude over {num_days} days — about {pct_of_workweek:.0%} of a 40-hour work week.",
+            })
+
+    # 5. Cost per active day.
+    if total > 0 and totals["active_days"] > 0:
+        cpd = total / totals["active_days"]
+        if cpd > 20:
+            candidates.append({
+                "score": min(cpd / 30, 3),
+                "text": f"You spent about ${cpd:.0f}/active day on Claude over this period.",
+            })
+
+    # 6. MCP/external services dominating.
+    mcp_cost_est = totals.get("mcp_tokens", 0) * 6.25 / 1e6
+    if total > 0 and mcp_cost_est > total * 0.15:
+        candidates.append({
+            "score": (mcp_cost_est / total) * 4,
+            "text": f"External services (Slack, Snowflake, Google Docs, etc.) account for ~${mcp_cost_est:.0f} of token spend — about {mcp_cost_est/total:.0%} of total.",
+        })
+
+    if not candidates:
+        return f"${total:.2f} of token spend across {len(sessions)} sessions and {hours:.1f} hours of active use."
+
+    candidates.sort(key=lambda x: -x["score"])
+    return candidates[0]["text"]
+
+
+def compute_targets(totals, sessions, num_days):
+    """Return progress vs target for a few key metrics."""
+    cache_rate = totals["cache_hit_rate"]
+    active_days = totals["active_days"]
+    opus_trivial_pct = totals["opus_trivial_pct"]
+    avg_session_depth = totals["total_messages"] / max(totals["sessions"], 1)
+
+    return [
+        {"name": "Cache hit rate", "value": cache_rate, "target": 0.80, "fmt": "pct",
+         "tip": "Higher = more context reused across messages. Long focused sessions help."},
+        {"name": "Active days/week", "value": min(active_days * 7 / max(num_days, 1), 7),
+         "target": 5, "fmt": "days", "tip": "How many days/week you used Claude Code."},
+        {"name": "Avg session depth", "value": avg_session_depth, "target": 15, "fmt": "msgs",
+         "tip": "Longer sessions amortize context-loading cost. Short sessions reload everything."},
+        {"name": "Opus on trivial work", "value": opus_trivial_pct, "target": 0.15, "fmt": "pct_inv",
+         "tip": "Lower = better. % of Opus tokens spent on read-only or Bash-only turns where Sonnet would suffice."},
+    ]
+
+
+# ── Analyze ──────────────────────────────────────────────────────────────────
+
+def analyze(all_sessions, date_from, date_to):
+    sliced = slice_sessions(all_sessions, date_from, date_to)
+    if not sliced:
+        return {"error": "No sessions found in this date range.", "sessions": 0}
+
     period_days = (date_to - date_from).days
     prev_from = date_from - timedelta(days=period_days + 1)
     prev_to = date_from - timedelta(days=1)
-    prev_sessions = [s for fpath in files if (s := parse_session(fpath, prev_from, prev_to))]
+    prev_sliced = slice_sessions(all_sessions, prev_from, prev_to)
 
-    if not sessions:
-        return {"error": "No sessions found in this date range.", "sessions": 0}
+    sessions = [s for s, _ in sliced]
 
-    # Aggregates
-    ti = sum(s["tokens_input"] for s in sessions)
-    to_ = sum(s["tokens_output"] for s in sessions)
-    tcr = sum(s["tokens_cache_read"] for s in sessions)
-    tcc = sum(s["tokens_cache_create"] for s in sessions)
-    ttok = ti + to_ + tcr + tcc
-    tcost = sum(s["cost_usd"] for s in sessions)
+    ti = sum(s["tokens"]["input"] for s in sessions)
+    to_ = sum(s["tokens"]["output"] for s in sessions)
+    tcr = sum(s["tokens"]["cache_read"] for s in sessions)
+    tcw5 = sum(s["tokens"]["cache_write_5m"] for s in sessions)
+    tcw1 = sum(s["tokens"]["cache_write_1h"] for s in sessions)
+    tcw = tcw5 + tcw1
+    ttok = ti + to_ + tcr + tcw
+    tcost = sum(s["cost_total"] for s in sessions)
     t_user = sum(s["messages_user"] for s in sessions)
     t_asst = sum(s["messages_assistant"] for s in sessions)
     t_dur = sum(s["duration_min"] for s in sessions)
     t_tools = sum(sum(s["tool_calls"].values()) for s in sessions)
+
+    cost_input = sum(s["cost"]["input"] for s in sessions)
+    cost_output = sum(s["cost"]["output"] for s in sessions)
+    cost_cache_read = sum(s["cost"]["cache_read"] for s in sessions)
+    cost_cache_write_5m = sum(s["cost"]["cache_write_5m"] for s in sessions)
+    cost_cache_write_1h = sum(s["cost"]["cache_write_1h"] for s in sessions)
+    cost_web_search = sum(s["cost"]["web_search"] for s in sessions)
+    web_search_n = sum(s["tokens"].get("web_search_requests", 0) for s in sessions)
 
     all_tools = defaultdict(int)
     for s in sessions:
@@ -560,122 +1072,212 @@ def analyze(date_from, date_to):
     model_tokens = defaultdict(int)
     model_cost = defaultdict(float)
     for s in sessions:
-        for m, t in s["model_tokens"].items(): model_tokens[m] += t
-        for m, c in s["model_cost"].items(): model_cost[m] += c
+        for m, t in s["by_model_tokens"].items():
+            model_tokens[m] += t
+        for m, c in s["by_model_cost"].items():
+            model_cost[m] += c
 
-    cache_denom = tcr + tcc + ti
+    cache_denom = tcr + tcw + ti
     cache_rate = tcr / cache_denom if cache_denom > 0 else 0
     tpm = to_ / t_asst if t_asst > 0 else 0
     cps = tcost / len(sessions)
     mps = (t_user + t_asst) / len(sessions)
     num_days = (date_to - date_from).days + 1
     proj_monthly = (tcost / num_days) * 30 if num_days > 0 else tcost
+    proj_yearly = proj_monthly * 12
 
     opus_tok = sum(t for m, t in model_tokens.items() if "opus" in m.lower())
     opus_pct = opus_tok / ttok if ttok > 0 else 0
     opus_cost = sum(c for m, c in model_cost.items() if "opus" in m.lower())
+    opus_total_w = sum(s.get("opus_total_tokens", 0) for s in sessions)
+    opus_trivial_w = sum(s.get("opus_trivial_tokens", 0) for s in sessions)
+    opus_trivial_pct = opus_trivial_w / opus_total_w if opus_total_w > 0 else 0
 
-    # Cost breakdown by token type (approximate — uses dominant model pricing)
-    dominant_model = max(model_tokens, key=model_tokens.get) if model_tokens else ""
-    dp = get_pricing(dominant_model)
-    cost_input = (ti / 1e6) * dp["input"]
-    cost_output = (to_ / 1e6) * dp["output"]
-    cost_cache_read = (tcr / 1e6) * dp["cache_read"]
-    cost_cache_write = (tcc / 1e6) * dp["cache_write"]
-
-    # Daily (per-message attribution)
     daily = defaultdict(lambda: {"sessions": set(), "tokens": 0, "cost": 0.0, "msgs": 0})
-    for s in sessions:
+    for s, in_dates in sliced:
         sid = s["session_id"] or id(s)
-        for day_str, dd in s["daily"].items():
-            daily[day_str]["sessions"].add(sid)
-            daily[day_str]["tokens"] += dd["tokens"]
-            daily[day_str]["cost"] += dd["cost"]
-            daily[day_str]["msgs"] += dd["msgs"]
-    daily_list = [{"date": k, "sessions": len(v["sessions"]), "tokens": v["tokens"], "cost": v["cost"], "msgs": v["msgs"]} for k, v in sorted(daily.items())]
+        for d, dd in in_dates.items():
+            daily[d]["sessions"].add(sid)
+            daily[d]["tokens"] += dd["tokens"]
+            daily[d]["cost"] += dd["cost"]
+            daily[d]["msgs"] += dd["msgs"]
+    daily_list = [{"date": k, "sessions": len(v["sessions"]), "tokens": v["tokens"],
+                   "cost": v["cost"], "msgs": v["msgs"]} for k, v in sorted(daily.items())]
 
-    # Models
-    model_list = [{"model": m, "tokens": t, "cost": model_cost.get(m, 0), "pct": t / ttok if ttok > 0 else 0} for m, t in sorted(model_tokens.items(), key=lambda x: -x[1])]
+    model_list = [{"model": m, "friendly": friendly_model_name(m), "tokens": t,
+                   "cost": model_cost.get(m, 0), "pct": t / ttok if ttok > 0 else 0}
+                  for m, t in sorted(model_tokens.items(), key=lambda x: -x[1])]
 
-    # Tools
     sorted_tools = sorted(all_tools.items(), key=lambda x: -x[1])[:12]
-    tools_list = [{"name": t.replace("mcp__", "").replace("__", "::"), "count": c} for t, c in sorted_tools]
+    tools_list = [{"name": t.replace("mcp__", "").replace("__", "::"),
+                   "friendly": friendly_tool_name(t),
+                   "raw": t, "count": c} for t, c in sorted_tools]
 
-    # ── Scores ──
-    u_score = score_usage(sessions, num_days)
-    e_score = score_efficiency(sessions)
+    u_score = score_usage(sliced, num_days)
+    e_score = score_efficiency(sliced)
     c_score = composite_score(u_score, e_score)
 
-    # ── Recommendations (section-linked) ──
-    recs = {"efficiency": [], "models": [], "tools": [], "daily": []}
+    total_mcp = sum(s["mcp_calls"] for s in sessions)
+    total_mcp_tokens = sum(s["mcp_tokens"] for s in sessions)
 
-    # Efficiency
-    if cache_rate >= 0.80:
-        recs["efficiency"].append({"type": "good", "title": "Excellent Cache Reuse", "body": f"Cache hit rate of {cache_rate:.0%} is excellent (benchmark: >80%). You're efficiently reusing context across messages."})
-    elif cache_rate < 0.60:
-        recs["efficiency"].append({"type": "warn", "title": "Low Cache Hit Rate", "body": f"Cache hit rate is {cache_rate:.0%} (benchmark: >60%). Try longer sessions — each new session re-processes your entire project context from scratch."})
+    mcp_tool_tokens = defaultdict(int)
+    for s in sessions:
+        for t, tok in s["mcp_tool_tokens"].items():
+            mcp_tool_tokens[t] += tok
+    mcp_heavy_tools = sorted(
+        [(t.replace("mcp__", "").replace("__", "::"), tok) for t, tok in mcp_tool_tokens.items()],
+        key=lambda x: -x[1])[:5]
+    mcp_heavy_friendly = [
+        {"name": n, "friendly": FRIENDLY_MCP.get(n, n), "tokens": tok,
+         "est_cost": tok * 6.25 / 1e6} for n, tok in mcp_heavy_tools
+    ]
+
+    active_days = len(daily_list)
+
+    totals = {
+        "total_cost": tcost, "total_messages": t_user + t_asst, "sessions": len(sessions),
+        "total_prompts": sum(s["total_prompts"] for s in sessions),
+        "short_prompts": sum(s["short_prompts"] for s in sessions),
+        "mcp_tokens": total_mcp_tokens, "total_mcp": total_mcp,
+        "mcp_heavy_tools": mcp_heavy_tools,
+        "cache_hit_rate": cache_rate, "active_days": active_days,
+        "opus_trivial_pct": opus_trivial_pct,
+    }
+
+    total_hours = t_dur / 60
+    top_finding = compute_top_finding(sessions, totals)
+    best_moments = compute_best_moments(sessions)
+    targets = compute_targets(totals, sessions, num_days)
+    hero_headline = compute_hero_headline(
+        totals,
+        {"cache_read": cost_cache_read, "cache_write_5m": cost_cache_write_5m,
+         "cache_write_1h": cost_cache_write_1h, "output": cost_output},
+        total_hours, sessions, num_days,
+    )
+
+    # Category aggregation
+    by_category = defaultdict(lambda: {"sessions": 0, "cost": 0.0, "messages": 0})
+    for s in sessions:
+        c = s["category"]
+        by_category[c]["sessions"] += 1
+        by_category[c]["cost"] += s["cost_total"]
+        by_category[c]["messages"] += s["messages_user"] + s["messages_assistant"]
+    categories = [{"name": k, **v, "cost_pct": v["cost"] / tcost if tcost > 0 else 0}
+                  for k, v in sorted(by_category.items(), key=lambda x: -x[1]["cost"])]
+
+    # Recommendations — deduped, with $ savings where possible.
+    recs = {"primary": [], "secondary": [], "good": []}
+
+    if cache_rate >= 0.85:
+        recs["good"].append({"title": "Excellent cache reuse",
+            "body": f"Cache hit rate of {cache_rate:.0%} — context is being reused well across messages."})
+    elif cache_rate < 0.65:
+        savings = tcost * 0.10
+        recs["primary"].append({"title": "Low cache hit rate",
+            "body": f"Cache hit rate is {cache_rate:.0%}. Longer sessions amortize the context-loading cost. Estimated impact: ~${savings:.0f}.",
+            "savings": savings})
 
     if mps >= 50:
-        recs["efficiency"].append({"type": "good", "title": "Deep, Focused Sessions", "body": f"Averaging {mps:.0f} messages per session — deep, sustained work that amortizes context-loading costs."})
+        recs["good"].append({"title": "Deep, focused sessions",
+            "body": f"Averaging {mps:.0f} messages per session — sustained work that amortizes context costs."})
     elif mps < 5:
-        recs["efficiency"].append({"type": "warn", "title": "Too Many Short Sessions", "body": f"Only {mps:.1f} messages per session. Each new session re-loads context from scratch. Batch related tasks together."})
+        savings = tcost * 0.15
+        recs["primary"].append({"title": "Many short sessions",
+            "body": f"Only {mps:.1f} messages per session. Batch related tasks together. Estimated impact: ~${savings:.0f}.",
+            "savings": savings})
 
     if 0 < tpm <= 300:
-        recs["efficiency"].append({"type": "good", "title": "Lean Responses", "body": f"Output tokens per message ({tpm:.0f}) is lean — concise, targeted answers."})
+        recs["good"].append({"title": "Lean responses",
+            "body": f"Output averages {tpm:.0f} tokens/message — concise and targeted."})
     elif tpm > 5000:
-        recs["efficiency"].append({"type": "info", "title": "Verbose Responses", "body": f"Output averages {tpm:,.0f} tokens/message. Try more specific prompts or asking for concise answers."})
+        savings = (tpm - 1500) * t_asst / 1e6 * 25 * 0.5
+        recs["secondary"].append({"title": "Verbose responses",
+            "body": f"Output averages {tpm:,.0f} tokens/message. Asking for shorter answers could save ~${savings:.0f}.",
+            "savings": savings})
 
     if cps > 5.0:
-        recs["efficiency"].append({"type": "info", "title": "High Session Cost", "body": f"Average ${cps:.2f}/session. Long exploratory sessions burn tokens on context that gets compressed. Consider focused, task-specific sessions."})
+        recs["secondary"].append({"title": "High session cost",
+            "body": f"Average ${cps:.2f}/session. Consider focused, task-specific sessions over long exploratory ones."})
 
-    # Models
-    if opus_pct > 0.80:
-        savings = opus_cost * 0.6
-        recs["models"].append({"type": "warn", "title": "High Opus Usage", "body": f"{opus_pct:.0%} of tokens on Opus (${opus_cost:.0f}). Routine tasks (file reads, simple edits) run fine on Sonnet at 60% lower cost — potential savings: ~${savings:.0f}."})
-    elif opus_pct <= 0.5 and opus_pct > 0:
-        recs["models"].append({"type": "good", "title": "Cost-Efficient Model Mix", "body": f"Only {opus_pct:.0%} Opus — you're matching model power to task complexity."})
+    stale_n = len([s for s in sessions if "stale-context" in s.get("flags", [])])
+    if stale_n:
+        savings = sum(s["cost_total"] for s in sessions if "stale-context" in s.get("flags", [])) * 0.4
+        recs["primary"].append({"title": f"Stale context in {stale_n} session(s)",
+            "body": f"These sessions averaged >300K cache reads per turn — Claude is re-reading content it no longer needs. Use /clear when switching tasks. Estimated impact: ~${savings:.0f}.",
+            "savings": savings})
 
-    # Tools
-    if t_tools > 0:
-        code_tools = sum(c for t, c in all_tools.items() if t in ("Edit", "Write"))
-        explore_tools = sum(c for t, c in all_tools.items() if t in ("Read", "Grep", "Glob", "Bash"))
-        mcp_count = sum(c for t, c in all_tools.items() if "mcp__" in t)
+    if opus_total_w > 0 and opus_trivial_pct >= 0.30:
+        savings = opus_cost * opus_trivial_pct * 0.6
+        recs["primary"].append({"title": "Opus on trivial work",
+            "body": f"{opus_trivial_pct:.0%} of Opus tokens went to read-only/Bash-only turns. Sonnet would suffice. Estimated impact: ~${savings:.0f}.",
+            "savings": savings})
+    elif opus_total_w > 0 and opus_trivial_pct <= 0.15:
+        recs["good"].append({"title": "Opus used where it counts",
+            "body": f"Only {opus_trivial_pct:.0%} of Opus tokens went to trivial turns — most Opus was on substantive work."})
 
-        if code_tools > 0 and explore_tools > 0:
-            ratio = explore_tools / code_tools
-            if ratio > 5:
-                recs["tools"].append({"type": "info", "title": "Exploration-Heavy", "body": f"{ratio:.0f}x more reading/searching ({explore_tools}) than editing ({code_tools}). Typical for research and code review. If you're writing code, provide more upfront context."})
-            elif ratio < 0.5:
-                recs["tools"].append({"type": "info", "title": "Write-Heavy", "body": f"More edits ({code_tools}) than reads ({explore_tools}). Heavy creation mode — Claude is actively producing artifacts."})
-            else:
-                recs["tools"].append({"type": "good", "title": "Balanced Read/Write", "body": f"Healthy mix of exploration ({explore_tools}) and creation ({code_tools}). Claude reads before writing."})
+    if total_mcp > 0 and (total_mcp_tokens > 100_000 or total_mcp > 100):
+        mcp_cost = total_mcp_tokens * 6.25 / 1e6
+        savings = mcp_cost * 0.4
+        top = ", ".join(t["friendly"] for t in mcp_heavy_friendly[:2])
+        recs["primary"].append({"title": "External services pulled large content",
+            "body": f"~{total_mcp_tokens // 1000}K tokens of tool results across {total_mcp} calls (~${mcp_cost:.0f}). Ask for summaries or specific ranges. Heaviest: {top}. Estimated impact: ~${savings:.0f}.",
+            "savings": savings})
 
-        # External integration detail is now in the consolidated health card
+    flagged = [s for s in sessions if s.get("flags")]
+    flag_counts = defaultdict(int)
+    for s in flagged:
+        for f in s["flags"]:
+            flag_counts[f] += 1
 
-        bash_count = all_tools.get("Bash", 0)
-        if bash_count > t_tools * 0.4:
-            recs["tools"].append({"type": "info", "title": "Heavy Bash Usage", "body": f"Bash is {bash_count / t_tools:.0%} of tool calls. Claude has dedicated Read, Edit, Grep, Glob tools that are more token-efficient for file ops."})
+    if flag_counts.get("bulk-read-no-output", 0) > 0:
+        recs["secondary"].append({"title": "Bulk reads without output",
+            "body": f"{flag_counts['bulk-read-no-output']} session(s) had 5+ file reads but no edits. Fine for research; otherwise it's exploration without a deliverable."})
+    if flag_counts.get("redundant-reads", 0) > 0:
+        n = sum(s["redundant_reads"] for s in flagged)
+        recs["secondary"].append({"title": "Redundant file reads",
+            "body": f"{n} times a file was re-read identically in the same session. Reference content already in context instead."})
+    if flag_counts.get("low-interaction", 0) > 0:
+        recs["secondary"].append({"title": "Low-interaction sessions",
+            "body": f"{flag_counts['low-interaction']} session(s) had fewer than 3 user messages but 10+ from Claude. Check that you're guiding the work."})
+    if flag_counts.get("truncated-output", 0) > 0:
+        recs["secondary"].append({"title": "Truncated responses",
+            "body": f"{flag_counts['truncated-output']} session(s) had assistant turns cut off at max_tokens. Ask for shorter outputs or break the request up."})
+    total_interrupts = sum(s["interrupts"] for s in sessions)
+    if total_interrupts > len(sessions) * 0.2:
+        recs["secondary"].append({"title": "Frequent interrupts",
+            "body": f"{total_interrupts} cancelled requests. Each interrupt wastes the tokens already spent. Be specific upfront."})
+    if sum(s["plan_mode_uses"] for s in sessions) > 0:
+        recs["good"].append({"title": "Using plan mode",
+            "body": f"{sum(s['plan_mode_uses'] for s in sessions)} plan-mode invocations. One of the cheapest ways to align before expensive work."})
 
-    # Daily
     if proj_monthly > 200:
-        recs["daily"].append({"type": "info", "title": "High Monthly Projection", "body": f"Projected ${proj_monthly:.0f}/mo. Benchmarks: moderate $30-50, power user $80-200. Not inherently bad if output justifies it."})
-    if daily_list:
-        peak = max(daily_list, key=lambda x: x["cost"])
-        if peak["cost"] > tcost * 0.25 and tcost > 5:
-            recs["daily"].append({"type": "info", "title": "Spending Spike", "body": f"Peak day ({peak['date']}) = {peak['cost'] / tcost:.0%} of total cost at ${peak['cost']:.2f}. Was it a justified deep-dive?"})
+        recs["secondary"].append({"title": "High monthly projection",
+            "body": f"At this pace, ~${proj_monthly:.0f}/mo (~${proj_yearly:.0f}/yr). Not a problem if output justifies it."})
+
+    short_pct = totals["short_prompts"] / max(totals["total_prompts"], 1)
+    detailed = sum(s["detailed_prompts"] for s in sessions) / max(totals["total_prompts"], 1)
+    if short_pct > 0.20:
+        savings = tcost * 0.08
+        recs["secondary"].append({"title": "Vague prompts",
+            "body": f"{round(short_pct * 100)}% of your prompts are under 20 characters. Specific prompts get the right answer first try. Estimated impact: ~${savings:.0f}.",
+            "savings": savings})
+    elif detailed > 0.20:
+        recs["good"].append({"title": "Specific prompts",
+            "body": f"{round(detailed * 100)}% of your prompts are 500+ characters."})
 
     # Trend
     trend = None
-    if prev_sessions:
-        p_out = sum(s["tokens_output"] for s in prev_sessions)
+    if prev_sliced:
+        prev_sessions = [s for s, _ in prev_sliced]
+        p_out = sum(s["tokens"]["output"] for s in prev_sessions)
         p_asst = sum(s["messages_assistant"] for s in prev_sessions)
         p_tpm = p_out / p_asst if p_asst > 0 else 0
-        p_cr = sum(s["tokens_cache_read"] for s in prev_sessions)
-        p_cc = sum(s["tokens_cache_create"] for s in prev_sessions)
-        p_inp = sum(s["tokens_input"] for s in prev_sessions)
-        p_denom = p_cr + p_cc + p_inp
+        p_cr = sum(s["tokens"]["cache_read"] for s in prev_sessions)
+        p_cw = sum(s["tokens"]["cache_write_5m"] + s["tokens"]["cache_write_1h"] for s in prev_sessions)
+        p_inp = sum(s["tokens"]["input"] for s in prev_sessions)
+        p_denom = p_cr + p_cw + p_inp
         p_cache = p_cr / p_denom if p_denom > 0 else 0
-        p_cost = sum(s["cost_usd"] for s in prev_sessions)
+        p_cost = sum(s["cost_total"] for s in prev_sessions)
         p_cps = p_cost / len(prev_sessions)
         trend = {
             "prev_tokens_per_msg": p_tpm, "curr_tokens_per_msg": tpm,
@@ -685,180 +1287,419 @@ def analyze(date_from, date_to):
             "prev_sessions": len(prev_sessions), "curr_sessions": len(sessions),
         }
 
-    # ── Session Health ──
-    total_reads = sum(s["reads"] for s in sessions)
-    total_writes = sum(s["writes"] for s in sessions)
-    total_mcp = sum(s["mcp_calls"] for s in sessions)
-    total_mcp_tokens = sum(s["mcp_tokens"] for s in sessions)
-    total_interrupts = sum(s["interrupts"] for s in sessions)
-    flagged_sessions = [s for s in sessions if s.get("flags")]
-    rw_ratio = total_reads / max(total_writes, 1) if total_writes > 0 else (total_reads if total_reads > 0 else 0)
-
-    # New deep signals
-    total_redundant_reads = sum(s["redundant_reads"] for s in sessions)
-    total_subagents = sum(s["subagent_spawns"] for s in sessions)
-    total_short_prompts = sum(s["short_prompts"] for s in sessions)
-    total_detailed_prompts = sum(s["detailed_prompts"] for s in sessions)
-    total_prompts = sum(s["total_prompts"] for s in sessions)
-    short_prompt_pct = total_short_prompts / max(total_prompts, 1)
-    detailed_prompt_pct = total_detailed_prompts / max(total_prompts, 1)
-    sessions_with_deep_loops = sum(1 for s in sessions if s["max_agent_streak"] >= 5)
-    avg_agent_streak = sum(s["max_agent_streak"] for s in sessions) / len(sessions)
-
-    # Aggregate MCP tokens by tool
-    mcp_tool_tokens = defaultdict(int)
+    # Top expensive turns + drill-down link
+    all_turns = []
     for s in sessions:
-        for t, tok in s["mcp_tool_tokens"].items():
-            mcp_tool_tokens[t] += tok
-    mcp_heavy_tools = sorted(
-        [(t.replace("mcp__", "").replace("__", "::"), tok) for t, tok in mcp_tool_tokens.items()],
-        key=lambda x: -x[1]
-    )[:5]
+        for t in s["per_turn_cost"]:
+            all_turns.append({**t, "session_label": s["label"], "session_category": s["category"]})
+    top_turns = sorted(all_turns, key=lambda x: -x["cost"])[:10]
 
-    # Session health recommendations — consolidated, no duplicates
-    FRIENDLY_MCP = {
-        "playwright::browser_take_screenshot": "Screenshots",
-        "granola::get_meeting_transcript": "Meeting Transcripts",
-        "google-workspace::readGoogleDoc": "Google Docs",
-        "figma::get_screenshot": "Figma Screenshots",
-        "snowflake::run_snowflake_query": "Snowflake Queries",
-        "snowflake::list_objects": "Snowflake Schema",
-        "slack::slack_read_thread": "Slack Threads",
-        "slack::slack_search_public": "Slack Search",
-        "glean_default::read_document": "Glean Documents",
-    }
+    # Bloat curves
+    bloat_sessions = sorted(
+        [s for s in sessions if s["avg_cache_read_per_turn"] > 50_000],
+        key=lambda s: -s["avg_cache_read_per_turn"]
+    )[:3]
+    bloat_curves = []
+    for s in bloat_sessions:
+        pts = s["per_turn_cache_read"]
+        if len(pts) > 30:
+            step = max(1, len(pts) // 30)
+            pts = pts[::step]
+        bloat_curves.append({
+            "session_id": s["session_id"], "label": s["label"], "category": s["category"],
+            "project": project_name_from_dir(s["project_dir"]) if s["project_dir"] else "?",
+            "messages": s["messages_user"] + s["messages_assistant"],
+            "cost": s["cost_total"],
+            "avg_cache_read": s["avg_cache_read_per_turn"],
+            "max_cache_read": s["max_cache_read_per_turn"],
+            "points": [{"idx": i, "cr": cr} for i, cr in pts],
+        })
 
-    recs["health"] = []
-    if flagged_sessions:
-        flag_counts = defaultdict(int)
-        for s in flagged_sessions:
-            for f in s["flags"]:
-                flag_counts[f] += 1
-
-        if flag_counts.get("bulk-read-no-output", 0) > 0:
-            n = flag_counts["bulk-read-no-output"]
-            recs["health"].append({"type": "warn", "title": "Bulk Reads Without Output",
-                "body": str(n) + " session(s) had 5+ file reads but zero edits or writes. If this is research, that's fine — but if not, it may be aimless browsing that burns tokens without producing anything."})
-
-        if flag_counts.get("low-interaction", 0) > 0:
-            n = flag_counts["low-interaction"]
-            recs["health"].append({"type": "warn", "title": "Low-Interaction Sessions",
-                "body": str(n) + " session(s) had fewer than 3 messages from you but 10+ from Claude. Claude may be running autonomously with minimal steering — check that you're guiding the work."})
-    if not flagged_sessions:
-        recs["health"].append({"type": "good", "title": "Clean Sessions", "body": "No sessions flagged for waste patterns. Your sessions are focused and productive."})
-
-    # Consolidated MCP insight (merge MCP-heavy + high ratio + heavy consumption)
-    if total_mcp > 0 and (total_mcp_tokens > 50000 or total_mcp > 100):
-        friendly_top = ", ".join(FRIENDLY_MCP.get(n, n) + " (~" + str(tok // 1000) + "K tokens)" for n, tok in mcp_heavy_tools[:3])
-        mcp_est_cost = total_mcp_tokens * dp["cache_write"] / 1e6  # rough: MCP results become cache writes
-        recs["health"].append({"type": "warn", "title": "External Service Costs",
-            "body": str(total_mcp) + " calls to external services consumed ~" + str(total_mcp_tokens // 1000) + "K tokens in results (est. ~$" + str(round(mcp_est_cost)) + "). Heaviest: " + friendly_top + ". Screenshots and full document reads are especially expensive — consider whether you need the full content or just a summary."})
-
-    # Consolidated interrupt insight (merge frequent + high rate)
-    if total_interrupts > len(sessions) * 0.2:
-        recs["health"].append({"type": "warn", "title": "Frequent Interrupts",
-            "body": str(total_interrupts) + " cancelled requests across " + str(len(sessions)) + " sessions. Each interrupt wastes the tokens Claude already spent generating its response. Being more specific upfront reduces the need to cancel mid-response."})
-
-    if total_redundant_reads > 20:
-        recs["health"].append({"type": "warn", "title": "Redundant File Reads",
-            "body": str(total_redundant_reads) + " times a file was re-read in the same session when it was already in context. Try asking Claude to reference content it already loaded instead of re-reading files."})
-
-    if sessions_with_deep_loops > len(sessions) * 0.3:
-        recs["health"].append({"type": "info", "title": "Frequent Agent Loops",
-            "body": str(sessions_with_deep_loops) + " sessions (" + str(round(sessions_with_deep_loops/len(sessions)*100)) + "%) had 5+ consecutive Claude turns without your input. Agent mode is powerful but burns tokens fast. Consider breaking complex tasks into steps you guide."})
-
-    if short_prompt_pct > 0.15:
-        recs["health"].append({"type": "warn", "title": "Vague Prompts",
-            "body": str(round(short_prompt_pct * 100)) + "% of your prompts are under 20 characters. Short prompts force Claude to guess what you want — leading to longer, more expensive responses."})
-    elif detailed_prompt_pct > 0.20:
-        recs["health"].append({"type": "good", "title": "Specific Prompts",
-            "body": str(round(detailed_prompt_pct * 100)) + "% of your prompts are 500+ characters. Detailed prompts help Claude get it right the first time."})
-
-    # ── Per-Project Breakdown ──
+    # Project breakdown
     proj_groups = defaultdict(list)
     for s in sessions:
-        proj_groups[s["_project_dir"]].append(s)
-
+        proj_groups[s["project_dir"]].append(s)
     projects = []
     for pdir, psessions in proj_groups.items():
-        pname = project_name_from_dir(pdir)
-        p_cost = sum(s["cost_usd"] for s in psessions)
-        p_tok = sum(s["tokens_input"] + s["tokens_output"] + s["tokens_cache_read"] + s["tokens_cache_create"] for s in psessions)
-        p_out = sum(s["tokens_output"] for s in psessions)
+        sliced_p = [(s, dict(s["by_date"])) for s in psessions]
+        p_cost = sum(s["cost_total"] for s in psessions)
+        p_tok = sum(sum(s["tokens"][k] for k in ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")) for s in psessions)
         p_msgs = sum(s["messages_user"] + s["messages_assistant"] for s in psessions)
-        p_tools = sum(sum(s["tool_calls"].values()) for s in psessions)
         p_writes = sum(s["writes"] for s in psessions)
         p_reads = sum(s["reads"] for s in psessions)
         p_mcp = sum(s["mcp_calls"] for s in psessions)
         p_dur = sum(s["duration_min"] for s in psessions)
-        p_eff = score_efficiency(psessions)
+        p_eff = score_efficiency(sliced_p)
         projects.append({
-            "name": pname,
-            "sessions": len(psessions),
-            "cost": p_cost,
-            "tokens": p_tok,
-            "output_tokens": p_out,
-            "messages": p_msgs,
-            "tool_calls": p_tools,
-            "writes": p_writes,
-            "reads": p_reads,
-            "mcp_calls": p_mcp,
-            "duration_min": p_dur,
-            "efficiency": p_eff,
+            "name": project_name_from_dir(pdir),
+            "sessions": len(psessions), "cost": p_cost, "tokens": p_tok,
+            "messages": p_msgs, "writes": p_writes, "reads": p_reads,
+            "mcp_calls": p_mcp, "duration_min": p_dur, "efficiency": p_eff,
             "cost_pct": p_cost / tcost if tcost > 0 else 0,
         })
     projects.sort(key=lambda x: -x["cost"])
 
+    # Profile labels (descriptive, not graded)
+    usage_band = _band(u_score, USAGE_BANDS)
+    eff_band = _band(e_score, EFFICIENCY_BANDS)
+    composite_band = _band(c_score, COMPOSITE_BANDS)
+
+    # Empty-state thresholds
+    is_low_data = len(sessions) < 5
+
     return {
-        "period": {"from": str(date_from), "to": str(date_to), "days": num_days},
+        "period": {"from": str(date_from), "to": str(date_to), "days": num_days, "active_days": active_days},
         "summary": {
             "sessions": len(sessions), "total_tokens": ttok,
             "total_cost": tcost, "total_user_msgs": t_user,
             "total_asst_msgs": t_asst, "total_tool_calls": t_tools,
             "total_duration_min": t_dur,
+            "total_hours": round(total_hours, 1),
             "tokens_input": ti, "tokens_output": to_,
-            "tokens_cache_read": tcr, "tokens_cache_create": tcc,
+            "tokens_cache_read": tcr,
+            "tokens_cache_write_5m": tcw5, "tokens_cache_write_1h": tcw1,
+            "web_search_requests": web_search_n,
         },
         "efficiency": {
             "tokens_per_msg": tpm, "cost_per_session": cps,
             "cache_hit_rate": cache_rate, "msgs_per_session": mps,
             "avg_duration_min": t_dur / len(sessions),
             "projected_monthly": proj_monthly,
-        },
-        "session_health": {
-            "total_reads": total_reads, "total_writes": total_writes,
-            "rw_ratio": rw_ratio, "total_mcp": total_mcp,
-            "total_mcp_tokens": total_mcp_tokens,
-            "avg_mcp_tokens": total_mcp_tokens // max(total_mcp, 1),
-            "mcp_heavy_tools": mcp_heavy_tools,
-            "total_interrupts": total_interrupts,
-            "flagged_count": len(flagged_sessions),
-            "clean_pct": round((1 - len(flagged_sessions) / len(sessions)) * 100),
-            "redundant_reads": total_redundant_reads,
-            "subagent_spawns": total_subagents,
-            "short_prompt_pct": round(short_prompt_pct * 100),
-            "detailed_prompt_pct": round(detailed_prompt_pct * 100),
-            "sessions_with_agent_loops": sessions_with_deep_loops,
-            "avg_agent_streak": round(avg_agent_streak, 1),
+            "projected_yearly": proj_yearly,
+            "opus_trivial_pct": opus_trivial_pct,
         },
         "scores": {
             "usage": u_score, "efficiency": e_score, "composite": c_score,
-            "tier": tier_label(c_score), "description": tier_desc(u_score, e_score),
-            "usage_label": usage_label(u_score)[0], "usage_desc": usage_label(u_score)[1],
-            "eff_label": efficiency_label(e_score)[0], "eff_desc": efficiency_label(e_score)[1],
+            "usage_band": usage_band, "efficiency_band": eff_band, "composite_band": composite_band,
         },
         "cost_breakdown": {
             "input": cost_input, "output": cost_output,
-            "cache_read": cost_cache_read, "cache_write": cost_cache_write,
+            "cache_read": cost_cache_read,
+            "cache_write_5m": cost_cache_write_5m, "cache_write_1h": cost_cache_write_1h,
+            "web_search": cost_web_search,
         },
-        "models": model_list, "opus_pct": opus_pct,
-        "tools": tools_list, "daily": daily_list,
-        "trend": trend, "recs": recs,
+        "hero_headline": hero_headline,
+        "top_finding": top_finding,
+        "best_moments": best_moments,
+        "targets": targets,
+        "categories": categories,
+        "models": model_list,
+        "opus_pct": opus_pct,
+        "tools": tools_list,
+        "daily": daily_list,
+        "trend": trend,
+        "recs": recs,
         "projects": projects,
+        "session_health": {
+            "total_reads": sum(s["reads"] for s in sessions),
+            "total_writes": sum(s["writes"] for s in sessions),
+            "total_mcp": total_mcp,
+            "total_mcp_tokens": total_mcp_tokens,
+            "mcp_heavy_tools": mcp_heavy_friendly,
+            "total_interrupts": total_interrupts,
+            "flagged_count": len(flagged),
+            "clean_pct": round((1 - len(flagged) / len(sessions)) * 100),
+            "redundant_reads": sum(s["redundant_reads"] for s in sessions),
+            "subagent_spawns": sum(s["subagent_spawns"] for s in sessions),
+            "skill_invocations": sum(s["skill_invocations"] for s in sessions),
+            "top_skills": sorted(
+                [(k, sum(s["skills_used"].get(k, 0) for s in sessions))
+                 for k in {k for s in sessions for k in s["skills_used"].keys()}],
+                key=lambda x: -x[1])[:5],
+            "plan_mode_uses": sum(s["plan_mode_uses"] for s in sessions),
+            "truncated_turns": sum(s["truncated_turns"] for s in sessions),
+            "stale_context_sessions": stale_n,
+        },
+        "top_turns": [{
+            "cost": t["cost"], "model": t["model"],
+            "model_friendly": friendly_model_name(t["model"]),
+            "tool": t["tool"], "tool_friendly": friendly_tool_name(t["tool"]),
+            "session_id": t["session_id"], "session_label": t["session_label"],
+            "session_category": t["session_category"],
+            "ts": t["ts"], "cache_read": t["cache_read"], "output": t["output"],
+            "cache_write": t["cache_write"], "driver": t["driver"],
+        } for t in top_turns],
+        "bloat_curves": bloat_curves,
+        "is_low_data": is_low_data,
     }
 
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
+def session_detail(all_sessions, session_id):
+    """Return per-turn breakdown for a single session."""
+    for s in all_sessions:
+        if s.get("session_id") == session_id:
+            return {
+                "session_id": s["session_id"],
+                "label": s["label"], "category": s["category"],
+                "project": project_name_from_dir(s["project_dir"]) if s["project_dir"] else "?",
+                "first_prompt": s["first_prompt"],
+                "messages_user": s["messages_user"],
+                "messages_assistant": s["messages_assistant"],
+                "duration_min": s["duration_min"],
+                "cost": s["cost_total"],
+                "cost_breakdown": dict(s["cost"]),
+                "tokens": dict(s["tokens"]),
+                "tools": [{"name": t, "friendly": friendly_tool_name(t), "count": c}
+                          for t, c in sorted(s["tool_calls"].items(), key=lambda x: -x[1])[:15]],
+                "flags": s["flags"],
+                "turns": [{
+                    "idx": t["idx"], "cost": t["cost"],
+                    "model_friendly": friendly_model_name(t["model"]),
+                    "tool_friendly": friendly_tool_name(t["tool"]),
+                    "cache_read": t["cache_read"],
+                    "cache_write": t["cache_write"],
+                    "output": t["output"], "driver": t["driver"],
+                    "ts": t["ts"],
+                } for t in s["per_turn_cost"]],
+            }
+    return {"error": "Session not found"}
+
+
+# ── Demo data fixture ───────────────────────────────────────────────────────
+# Synthetic sessions for screenshots, demos, and previewing the tool before
+# you have logs of your own. Deterministic (seeded), no real data.
+
+DEMO_PROJECT_DIRS = {
+    "/demo/projects/demo-app":         "demo-app",
+    "/demo/projects/data-pipeline":    "data-pipeline",
+    "/demo/projects/analytics":        "analytics",
+    "/demo/projects/design-system":    "design-system",
+}
+
+DEMO_LABELS = {
+    "Coding": [
+        "Refactor authentication module to support SSO providers",
+        "Add unit tests for the user service edge cases",
+        "Fix the race condition in the queue processing worker",
+        "Implement the new payments webhook handler with retry logic",
+        "Migrate legacy logging to structured logs across services",
+        "Rewrite the rate-limiter to use a sliding window",
+        "Build the admin CLI for tenant onboarding and offboarding",
+    ],
+    "Data Analysis": [
+        "Investigate why DAU dropped on Tuesday — is it real?",
+        "Pull conversion metrics for the Q2 leadership review",
+        "Build the cohort retention query for engagement analysis",
+        "Compare regional performance week over week",
+        "Size the A/B test for the new checkout flow",
+    ],
+    "PM Work": [
+        "Prep for Monday weekly with leadership — agenda and updates",
+        "Digest the planning meeting and update the brief",
+        "Draft the launch email for the new feature",
+        "Investigate the customer support escalation about exports",
+        "Run the morning sync — review yesterday and surface action items",
+    ],
+    "Design Work": [
+        "Review the new onboarding flow in Figma",
+        "Iterate on the dashboard layout for narrow viewports",
+    ],
+    "Debugging": [
+        "Debug why the deploy is failing on staging since this morning",
+        "Investigate the memory leak in the worker process",
+    ],
+    "Research": [
+        "Research how competitors handle multi-tenant data isolation",
+        "Look into the new gRPC streaming patterns for large payloads",
+    ],
+    "Writing": [
+        "Write the design doc for cache invalidation across services",
+        "Draft the post-mortem for last week's incident",
+    ],
+}
+
+DEMO_TOOL_PROFILES = {
+    "Coding":        {"Edit": (5, 25), "Write": (1, 6), "Read": (8, 30), "Bash": (3, 12), "Grep": (1, 8), "Glob": (1, 4)},
+    "Data Analysis": {"mcp__snowflake__run_snowflake_query": (3, 12), "mcp__snowflake__list_objects": (1, 4), "Read": (2, 8), "Edit": (0, 3)},
+    "PM Work":       {"mcp__granola__get_meeting_transcript": (1, 4), "mcp__slack__slack_read_thread": (2, 7), "mcp__google-workspace__editGoogleDoc": (1, 4), "mcp__google-workspace__readGoogleDoc": (1, 5), "Read": (1, 5)},
+    "Design Work":   {"mcp__figma__get_design_context": (1, 4), "mcp__figma__get_screenshot": (0, 3), "Read": (1, 5)},
+    "Debugging":     {"Read": (10, 30), "Bash": (5, 18), "Grep": (3, 10), "Edit": (1, 6)},
+    "Research":      {"mcp__glean_default__search": (2, 8), "mcp__glean_default__read_document": (1, 5), "WebSearch": (1, 4), "Read": (3, 10)},
+    "Writing":       {"mcp__google-workspace__editGoogleDoc": (1, 4), "Read": (3, 12), "Edit": (1, 4), "Write": (0, 2)},
+}
+
+
+def generate_demo_sessions(n_sessions=85, end_date=None, seed=42):
+    """Build deterministic synthetic session records that match the parser shape."""
+    rng = random.Random(seed)
+    if end_date is None:
+        end_date = datetime.now(timezone.utc).date()
+
+    # Pre-populate project name cache so render uses friendly demo names.
+    for path, name in DEMO_PROJECT_DIRS.items():
+        _project_name_cache[path] = name
+
+    project_paths = list(DEMO_PROJECT_DIRS.keys())
+    categories = list(DEMO_LABELS.keys())
+    cat_weights = [38, 22, 18, 5, 8, 5, 4]  # Coding-heavy, then Data/PM
+
+    sessions = []
+    for i in range(n_sessions):
+        category = rng.choices(categories, weights=cat_weights)[0]
+        label = rng.choice(DEMO_LABELS[category])
+
+        # Date — concentrated in the last 14 days, tail back to 32.
+        days_back = int(min(31, max(0, abs(rng.gauss(8, 8)))))
+        if rng.random() < 0.15:  # weekend bias — skip occasionally
+            days_back += 1
+        sess_date = end_date - timedelta(days=days_back)
+
+        # Long session ~12% of the time.
+        is_long = rng.random() < 0.12
+        n_assistant = rng.randint(50, 200) if is_long else rng.randint(2, 35)
+        n_user = max(1, n_assistant // rng.randint(2, 4))
+
+        # Cost — proportional to length, with multipliers for long/heavy sessions.
+        base = n_assistant * rng.uniform(0.04, 0.18)
+        if is_long: base *= rng.uniform(1.5, 2.8)
+        cost_target = max(0.05, base)
+
+        # Token mix — cache reads dominate (the central insight of the tool).
+        cache_read = int(cost_target * 100_000 * rng.uniform(2.5, 7.5))
+        cache_write = int(cost_target * 100_000 * rng.uniform(0.4, 0.8))
+        output_tok = int(rng.randint(120, 700) * n_assistant)
+        input_tok = int(rng.randint(15, 180) * n_user)
+
+        # Model — Opus heavy, but task-fit varies.
+        model = rng.choices(
+            ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+            weights=[55, 25, 18, 2]
+        )[0]
+
+        project_dir = rng.choice(project_paths)
+
+        # Tool calls per category
+        tool_calls = defaultdict(int)
+        profile = DEMO_TOOL_PROFILES.get(category, {})
+        for tool, (lo, hi) in profile.items():
+            if hi > 0:
+                tool_calls[tool] = rng.randint(lo, hi)
+
+        # Build session record with same shape as the real parser.
+        sess = _new_session()
+        sess["session_id"] = f"demo-{i:04d}-{rng.randint(1000,9999):04x}"
+        sess["project_dir"] = project_dir
+        sess["label"] = label
+        sess["category"] = category
+        sess["first_prompt"] = label
+        sess["messages_user"] = n_user
+        sess["messages_assistant"] = n_assistant
+
+        sess["tokens"]["input"] = input_tok
+        sess["tokens"]["output"] = output_tok
+        sess["tokens"]["cache_read"] = cache_read
+        sess["tokens"]["cache_write_5m"] = cache_write
+        sess["tokens"]["cache_write_1h"] = 0
+        sess["tokens"]["web_search_requests"] = 0
+
+        # Compute costs the same way the real path does, so totals reconcile.
+        p = get_pricing(model)
+        sess["cost"]["input"] = (input_tok / 1e6) * p["input"]
+        sess["cost"]["output"] = (output_tok / 1e6) * p["output"]
+        sess["cost"]["cache_read"] = (cache_read / 1e6) * p["cache_read"]
+        sess["cost"]["cache_write_5m"] = (cache_write / 1e6) * p["cache_write_5m"]
+        sess["cost"]["cache_write_1h"] = 0
+        sess["cost"]["web_search"] = 0
+        sess["cost_total"] = sum(sess["cost"][k] for k in
+            ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h", "web_search"))
+
+        ttok_total = input_tok + output_tok + cache_read + cache_write
+        sess["by_model_tokens"][model] = ttok_total
+        sess["by_model_cost"][model] = sess["cost_total"]
+        sess["tool_calls"] = tool_calls
+        sess["reads"] = sum(c for t, c in tool_calls.items() if t in READ_TOOLS)
+        sess["writes"] = sum(c for t, c in tool_calls.items() if t in WRITE_TOOLS)
+        sess["mcp_calls"] = sum(c for t, c in tool_calls.items() if "mcp__" in t)
+
+        date_str = str(sess_date)
+        sess["by_date"][date_str] = {"tokens": ttok_total, "cost": sess["cost_total"], "msgs": n_user + n_assistant}
+        sess["first_date"] = sess_date
+        sess["last_date"] = sess_date
+        ts = datetime.combine(sess_date, datetime.min.time(), timezone.utc) + timedelta(hours=rng.randint(8, 18))
+        # Per-turn timestamps spaced 1-3 min apart so focused-minutes calc gets a realistic value.
+        turn_gaps = [rng.uniform(0.7, 2.5) for _ in range(n_assistant)]
+        cumulative = 0.0
+        turn_timestamps = []
+        for g in turn_gaps:
+            cumulative += g
+            turn_timestamps.append(ts + timedelta(minutes=cumulative))
+        sess["timestamps"] = [ts] + turn_timestamps
+        sess["span_min"] = cumulative
+        # focused minutes — same as cumulative since gaps are all ≤ 5 min by construction
+        sess["duration_min"] = sum(g for g in turn_gaps if 0 < g <= 5)
+
+        # Per-turn cost — power-law spread; small fraction take big share.
+        avg_turn_cost = sess["cost_total"] / max(n_assistant, 1)
+        per_turn = []
+        cache_read_per_turn = cache_read // max(n_assistant, 1)
+        cache_write_per_turn = cache_write // max(n_assistant, 1)
+        for j in range(n_assistant):
+            multiplier = rng.choices([0.3, 0.7, 1.0, 1.5, 3.0], weights=[20, 35, 25, 15, 5])[0]
+            tc = avg_turn_cost * multiplier
+            tool = rng.choice(list(tool_calls.keys()) + ["(text-only)", "(text-only)"]) if tool_calls else "(text-only)"
+            cr = int(cache_read_per_turn * (1 + (j / max(n_assistant, 1)) * 1.5))  # bloat-staircase pattern
+            cw = int(cache_write_per_turn * rng.uniform(0.7, 1.3))
+            ot = int(output_tok / max(n_assistant, 1) * rng.uniform(0.5, 1.5))
+            driver = "cache_read" if cr > cw * 2 else "cache_write" if cw > ot * 5 else "output"
+            per_turn.append({
+                "idx": j + 1, "cost": tc, "model": model,
+                "tool": tool,
+                "ts": (ts + timedelta(minutes=j * 1.5)).isoformat(),
+                "session_id": sess["session_id"],
+                "cache_read": cr, "output": ot, "cache_write": cw, "driver": driver,
+            })
+        sess["per_turn_cost"] = per_turn
+        sess["per_turn_cache_read"] = [(t["idx"], t["cache_read"]) for t in per_turn]
+        sess["avg_cache_read_per_turn"] = sum(t["cache_read"] for t in per_turn) / max(len(per_turn), 1)
+        sess["max_cache_read_per_turn"] = max((t["cache_read"] for t in per_turn), default=0)
+
+        # Flags — sprinkled realistically.
+        flags = []
+        if sess["avg_cache_read_per_turn"] > 300_000:
+            flags.append("stale-context")
+        if sess["reads"] > 5 and sess["writes"] == 0 and rng.random() < 0.6:
+            flags.append("bulk-read-no-output")
+        if rng.random() < 0.04:
+            flags.append("redundant-reads")
+        if rng.random() < 0.03:
+            flags.append("low-interaction")
+        if rng.random() < 0.02:
+            flags.append("truncated-output")
+        sess["flags"] = flags
+
+        # Prompts
+        sess["total_prompts"] = n_user
+        sess["short_prompts"] = int(n_user * rng.uniform(0, 0.20))
+        sess["detailed_prompts"] = int(n_user * rng.uniform(0.10, 0.40))
+        sess["short_prompt_pct"] = sess["short_prompts"] / max(n_user, 1)
+
+        sess["interrupts"] = rng.choices([0, 0, 0, 1, 2], weights=[60, 20, 10, 7, 3])[0]
+        sess["redundant_reads"] = rng.choices([0, 0, 0, 1, 3, 7], weights=[70, 12, 8, 5, 3, 2])[0]
+        sess["max_agent_streak"] = rng.randint(1, 9)
+        sess["truncated_turns"] = 1 if "truncated-output" in flags else 0
+        sess["subagent_spawns"] = rng.choices([0, 0, 1, 2], weights=[60, 25, 10, 5])[0]
+        sess["skill_invocations"] = rng.randint(0, 3) if category == "PM Work" else (1 if rng.random() < 0.05 else 0)
+        sess["skills_used"] = defaultdict(int)
+        if sess["skill_invocations"] > 0:
+            for _ in range(sess["skill_invocations"]):
+                skill = rng.choice(["morning-sync", "digest-meeting", "debrief-thread", "weekly-status", "review-pr"])
+                sess["skills_used"][skill] += 1
+        sess["plan_mode_uses"] = rng.choices([0, 0, 0, 1, 2], weights=[70, 15, 8, 5, 2])[0]
+        sess["sidechain_cost"] = 0
+        sess["sidechain_tokens"] = 0
+        sess["mcp_tools"] = defaultdict(int, {t: c for t, c in tool_calls.items() if "mcp__" in t})
+        sess["mcp_tokens"] = sess["mcp_calls"] * rng.randint(2000, 25000)
+        sess["mcp_tool_tokens"] = defaultdict(int, {t: c * rng.randint(2000, 30000) for t, c in tool_calls.items() if "mcp__" in t})
+        sess["read_signatures"] = defaultdict(int)
+        sess["opus_total_tokens"] = ttok_total if "opus" in model else 0
+        sess["opus_trivial_tokens"] = int(ttok_total * rng.uniform(0.05, 0.30)) if "opus" in model else 0
+
+        sessions.append(sess)
+
+    return sessions
+
+
+# ── HTML ─────────────────────────────────────────────────────────────────────
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -867,12 +1708,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude Code Efficiency Analyzer</title>
 <style>
-:root{--bg:#f5f6f8;--s1:#fff;--s2:#f0f1f4;--s3:#e5e7ee;--border:#dde0e8;--text:#1a1d2b;--muted:#6b7085;--dim:#9298b0;--accent:#6366f1;--green:#16a34a;--green-dim:rgba(22,163,74,.08);--yellow:#ca8a04;--yellow-dim:rgba(202,138,4,.08);--orange:#ea580c;--orange-dim:rgba(234,88,12,.08);--red:#dc2626;--blue:#2563eb;--blue-dim:rgba(37,99,235,.07)}
+:root{--bg:#f5f6f8;--s1:#fff;--s2:#f0f1f4;--s3:#e5e7ee;--border:#dde0e8;--text:#1a1d2b;--muted:#6b7085;--dim:#9298b0;--accent:#6366f1;--green:#16a34a;--green-dim:rgba(22,163,74,.08);--yellow:#ca8a04;--yellow-dim:rgba(202,138,4,.08);--orange:#ea580c;--orange-dim:rgba(234,88,12,.08);--red:#dc2626;--blue:#2563eb;--blue-dim:rgba(37,99,235,.07);--purple:#a855f7}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.5;min-height:100vh}
 .wrap{max-width:1140px;margin:0 auto;padding:28px 24px 60px}
-.header{margin-bottom:24px}.header h1{font-size:22px;font-weight:700;margin-bottom:2px}.header p{font-size:13px;color:var(--muted)}
-.avail{background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:14px 18px;margin:16px 0;font-size:13px;color:var(--muted)}.avail strong{color:var(--text)}
+.header{margin-bottom:14px}.header h1{font-size:22px;font-weight:700;margin-bottom:2px}.header p{font-size:13px;color:var(--muted)}
+.header-row{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.header-actions{display:flex;gap:8px;align-items:center}
+.toggle{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);cursor:pointer;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--s1)}
+.toggle input{margin:0}
+.toggle:hover{background:var(--s2)}
+.toggle.on{background:var(--blue-dim);border-color:var(--blue);color:var(--blue)}
+.btn-print{padding:6px 12px;border:1px solid var(--border);background:var(--s1);color:var(--muted);font-size:11px;border-radius:6px;cursor:pointer;font-family:inherit}
+.btn-print:hover{background:var(--s2);color:var(--text)}
+.banner{background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:12px 16px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:flex-start;gap:14px;font-size:12px}
+.banner h4{font-size:13px;font-weight:700;color:#9a3412;margin-bottom:3px}
+.banner p{color:#7c2d12}
+.banner button{background:transparent;border:none;color:#9a3412;font-size:18px;cursor:pointer;line-height:1;font-family:inherit;padding:0 4px}
+.avail{background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:14px 18px;margin:14px 0;font-size:13px;color:var(--muted)}.avail strong{color:var(--text)}
 .controls{display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap}
 .dw input[type="date"]{background:var(--s1);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;font-family:inherit;cursor:pointer;min-width:150px}
 .dw input:focus{outline:none;border-color:var(--accent)}
@@ -881,44 +1734,128 @@ button{padding:8px 20px;border-radius:6px;font-size:13px;cursor:pointer;border:n
 .bg{background:var(--s1);color:var(--muted);border:1px solid var(--border)}.bg:hover{color:var(--text);background:var(--s2)}.bg.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 .sep{color:var(--dim);font-size:13px}
 #status{font-size:12px;color:var(--muted);margin-left:8px}
-.score-section{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:0;align-items:center;margin-bottom:24px}
-.score-card{background:var(--s1);border:1px solid var(--border);border-radius:12px;padding:22px 18px;text-align:center}
-.score-card.main{padding:22px 18px;border:2px solid var(--border);box-shadow:0 2px 12px rgba(0,0,0,.05)}
-.score-num{font-size:48px;font-weight:800;line-height:1}.score-num.big{font-size:48px}
-.score-label{font-size:11px;color:var(--muted);margin-top:4px;text-transform:uppercase;letter-spacing:.5px;font-weight:600}
-.score-tier{display:inline-block;margin-top:10px;padding:4px 16px;border-radius:20px;font-size:13px;font-weight:600}
-.score-desc{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.4}
-.score-sub{margin-top:8px;font-size:13px;font-weight:600}.score-subdesc{font-size:11px;color:var(--muted);margin-top:2px;line-height:1.4}
-.score-op{font-size:24px;font-weight:300;color:var(--dim);text-align:center;padding:0 6px}
+
+/* TL;DR hero */
+.hero{background:linear-gradient(135deg,#eef2ff,#f5f3ff);border:1px solid #c7d2fe;border-radius:14px;padding:24px;margin-bottom:20px;box-shadow:0 2px 12px rgba(99,102,241,.08)}
+.hero-headline{font-size:22px;font-weight:700;color:var(--text);margin-bottom:8px;line-height:1.3}
+.hero-action{font-size:14px;color:#3730a3;background:#fff;padding:10px 14px;border-radius:8px;border:1px solid #c7d2fe;margin-bottom:14px;line-height:1.5}
+.hero-action strong{color:#1e1b4b}
+.hero-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:8px}
+.hero-stat{text-align:left}
+.hero-stat .v{font-size:22px;font-weight:800;color:var(--text);line-height:1.1}
+.hero-stat .l{font-size:11px;color:var(--muted);margin-top:3px;text-transform:uppercase;letter-spacing:.4px;font-weight:600}
+.hero-stat .s{font-size:11px;color:var(--dim);margin-top:3px}
+.hero-profile{font-size:12px;color:var(--muted);margin-top:10px;border-top:1px solid #c7d2fe;padding-top:10px}
+.hero-profile strong{color:var(--text)}
+
+.color-key{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:18px}
+.color-key .key-item{display:inline-flex;align-items:center;gap:5px}
+.color-key .ck{width:9px;height:9px;border-radius:2px}
+
+.section-h{font-size:11px;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;margin:26px 0 10px 0}
+
 .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
 .card{background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:16px}
-.card .v{font-size:24px;font-weight:800;line-height:1.1}.card .l{font-size:11px;color:var(--muted);margin-top:3px}.card .s{font-size:10px;color:var(--dim);margin-top:6px;padding-top:6px;border-top:1px solid var(--border)}
-.tri-cols{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:20px}
+.card .v{font-size:22px;font-weight:800;line-height:1.1}.card .l{font-size:11px;color:var(--muted);margin-top:3px}.card .s{font-size:10px;color:var(--dim);margin-top:6px;padding-top:6px;border-top:1px solid var(--border)}
 .cols{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px}
-.panel{background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:20px}.panel h3{font-size:14px;font-weight:600;margin-bottom:4px}.panel-sub{font-size:11px;color:var(--dim);margin-bottom:14px}
+.tri-cols{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px}
+.panel{background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:20px}
+.panel.primary{border-color:#fed7aa;background:#fffbf5}
+.panel h3{font-size:14px;font-weight:600;margin-bottom:4px}
+.panel-sub{font-size:11px;color:var(--dim);margin-bottom:14px}
+
+.target{margin-bottom:14px}
+.target-h{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;margin-bottom:5px}
+.target-h .lbl{font-weight:600}
+.target-h .val{color:var(--muted)}
+.target-bar{height:8px;background:var(--s3);border-radius:4px;overflow:hidden;position:relative}
+.target-fill{height:100%;border-radius:4px;transition:width .6s ease}
+.target-marker{position:absolute;top:-3px;width:2px;height:14px;background:var(--text);opacity:.4}
+.target-tip{font-size:10px;color:var(--dim);margin-top:4px}
+
+.rec{padding:11px 14px;border-radius:8px;margin-bottom:7px;border-left:3px solid;font-size:12px}
+.rec-good{background:var(--green-dim);border-color:var(--green)}.rec-warn{background:var(--yellow-dim);border-color:var(--yellow)}.rec-info{background:var(--blue-dim);border-color:var(--blue)}.rec-primary{background:var(--orange-dim);border-color:var(--orange)}
+.rec h4{font-size:12px;font-weight:700;margin-bottom:3px}.rec p{font-size:11px;color:var(--muted);line-height:1.5}
+.rec-good h4{color:var(--green)}.rec-warn h4{color:var(--yellow)}.rec-info h4{color:var(--blue)}.rec-primary h4{color:var(--orange)}
+.rec .savings{display:inline-block;background:#fff;border:1px solid currentColor;color:inherit;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;margin-left:6px}
+
 .gr{display:flex;align-items:center;gap:12px;margin-bottom:12px}.gl{width:110px;font-size:11px;color:var(--muted);text-align:right;flex-shrink:0}
 .gt{flex:1;height:7px;background:var(--s3);border-radius:4px;overflow:hidden}.gf{height:100%;border-radius:4px;transition:width .6s ease}.gv{width:65px;font-size:12px;font-weight:600}
-.br{display:flex;align-items:center;gap:8px;margin-bottom:5px}.bl{width:70px;font-size:10px;color:var(--muted);text-align:right;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.br{display:flex;align-items:center;gap:8px;margin-bottom:5px}.bl{width:140px;font-size:11px;color:var(--muted);text-align:left;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bt{flex:1;height:20px;background:var(--s3);border-radius:3px;overflow:hidden}.bf{height:100%;border-radius:3px;display:flex;align-items:center;padding-left:6px;font-size:9px;font-weight:600;color:#fff;transition:width .5s ease;min-width:2px}
-.bv{width:60px;font-size:10px;text-align:right;color:var(--muted);flex-shrink:0}
+.bv{width:90px;font-size:10px;text-align:right;color:var(--muted);flex-shrink:0}
+
+.tt{width:100%;border-collapse:collapse;font-size:11px}
+.tt th{padding:6px 8px;color:var(--muted);font-weight:600;text-align:left;border-bottom:2px solid var(--border)}
+.tt td{padding:8px;border-bottom:1px solid var(--border)}
+.tt tr.clickable{cursor:pointer;transition:background .15s}
+.tt tr.clickable:hover{background:var(--s2)}
+.session-link{color:var(--accent);cursor:pointer;text-decoration:none;border-bottom:1px dashed var(--accent)}
+.session-link:hover{color:#4f46e5}
+
+.spark{display:flex;align-items:flex-end;height:42px;gap:1px;width:100%}
+.spark .b{flex:1;background:var(--blue);border-radius:1px;min-height:1px;cursor:pointer}
+.spark .b:hover{background:var(--accent)}
+
+.cat-pill{display:inline-block;font-size:10px;font-weight:600;padding:2px 8px;border-radius:10px;background:var(--s2);color:var(--muted);margin-right:4px}
+.cat-coding{background:#dbeafe;color:#1e40af}
+.cat-data-analysis{background:#dcfce7;color:#166534}
+.cat-pm-work{background:#fef3c7;color:#92400e}
+.cat-design-work{background:#fce7f3;color:#9d174d}
+.cat-debugging{background:#fee2e2;color:#991b1b}
+.cat-research{background:#ede9fe;color:#5b21b6}
+.cat-writing{background:#fff1e6;color:#9a3412}
+
 .tr{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--border)}.tr:last-child{border-bottom:none}
 .tm{width:110px;font-size:12px;color:var(--muted)}.tv{font-size:13px;flex:1}
 .ta{font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px}
 .ta-ug{background:var(--green-dim);color:var(--green)}.ta-ub{background:var(--orange-dim);color:var(--orange)}.ta-dg{background:var(--green-dim);color:var(--green)}.ta-db{background:var(--orange-dim);color:var(--orange)}.ta-s{background:var(--blue-dim);color:var(--blue)}
-.rec{padding:11px 14px;border-radius:8px;margin-bottom:7px;border-left:3px solid}
-.rec-good{background:var(--green-dim);border-color:var(--green)}.rec-warn{background:var(--yellow-dim);border-color:var(--yellow)}.rec-info{background:var(--blue-dim);border-color:var(--blue)}
-.rec h4{font-size:12px;font-weight:600;margin-bottom:2px}.rec p{font-size:11px;color:var(--muted);line-height:1.4}
-.rec-good h4{color:var(--green)}.rec-warn h4{color:var(--yellow)}.rec-info h4{color:var(--blue)}
-.srecs{margin-top:12px}
+
+.score-tile{background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:14px;text-align:center;font-size:11px;color:var(--muted)}
+.score-tile .num{font-size:28px;font-weight:800;line-height:1}
+.score-tile .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.4px;font-weight:600;margin-top:4px}
+.score-tile .desc{font-size:10px;margin-top:4px}
+
+.miniStat{text-align:center;padding:0 8px}
+.miniStat .v{font-size:18px;font-weight:700}
+.miniStat .l{font-size:10px;color:var(--muted);margin-top:2px}
+
+.empty-state{text-align:center;padding:60px 24px;background:var(--s1);border:1px solid var(--border);border-radius:12px;margin-bottom:20px}
+.empty-state h3{font-size:16px;margin-bottom:8px}
+.empty-state p{font-size:13px;color:var(--muted);max-width:520px;margin:0 auto 12px;line-height:1.5}
+
+.modal-bg{position:fixed;inset:0;background:rgba(15,17,30,.45);display:none;z-index:100;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto}
+.modal-bg.open{display:flex}
+.modal{background:var(--s1);border-radius:12px;max-width:900px;width:100%;padding:24px;box-shadow:0 16px 48px rgba(15,17,30,.18);position:relative}
+.modal-close{position:absolute;top:12px;right:14px;background:transparent;border:none;font-size:22px;cursor:pointer;color:var(--muted);font-family:inherit}
+.modal-close:hover{color:var(--text)}
+.modal h2{font-size:16px;margin-bottom:4px;padding-right:30px}
+.modal-sub{font-size:11px;color:var(--muted);margin-bottom:16px}
+
 .loading{text-align:center;padding:60px 0;color:var(--muted);font-size:14px}.hidden{display:none}
 .footer{text-align:center;padding:24px 0;font-size:11px;color:var(--dim)}.footer a{color:var(--accent);text-decoration:none}.footer code{background:var(--s2);padding:1px 5px;border-radius:3px;font-size:10px}
-@media(max-width:900px){.tri-cols{grid-template-columns:1fr}}
-@media(max-width:800px){.cards{grid-template-columns:repeat(2,1fr)}.cols{grid-template-columns:1fr}.score-section{grid-template-columns:1fr;gap:12px}.score-op{display:none}}
+
+@media print{
+  .controls,.header-actions,.banner button,.session-link,.modal-bg,.btn-print,.toggle{display:none!important}
+  .wrap{max-width:none;padding:8px}
+  .panel{break-inside:avoid;page-break-inside:avoid}
+  body{background:#fff}
+  .hero{box-shadow:none;background:#f8f9fc}
+}
+@media(max-width:900px){.tri-cols{grid-template-columns:1fr};.hero-stats{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:800px){.cards{grid-template-columns:repeat(2,1fr)}.cols{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="header"><h1>Claude Code Efficiency Analyzer</h1><p>Analyzes your local Claude Code session logs to help you understand your spending, token distribution, and where you can be more efficient.</p></div>
+  <div class="header"><div class="header-row">
+    <div><h1>Claude Code Efficiency Analyzer</h1><p>Reads your local Claude Code session logs. No data leaves your machine.</p></div>
+    <div class="header-actions">
+      <label class="toggle" id="privacyToggle"><input type="checkbox" id="privacy"> Privacy mode</label>
+      <button class="btn-print" onclick="window.print()">Print / PDF</button>
+    </div>
+  </div></div>
+  <div id="banner" class="hidden"></div>
   <div id="avail" class="avail">Scanning local logs...</div>
   <div class="controls">
     <div class="dw"><input type="date" id="df" onclick="this.showPicker&&this.showPicker()"></div>
@@ -933,239 +1870,470 @@ button{padding:8px 20px;border-radius:6px;font-size:13px;cursor:pointer;border:n
   </div>
   <div id="dash" class="hidden"></div>
   <div id="loading" class="loading hidden"></div>
-  <div class="footer">Reads <code>~/.claude/projects/</code> only. No data leaves your machine. Cost estimates use <a href="https://platform.claude.com/docs/en/about-claude/pricing" target="_blank">Anthropic published pricing</a> — enterprise rates may differ.</div>
+  <div class="footer">Reads <code>~/.claude/projects/</code> only. Cost estimates use <a href="https://platform.claude.com/docs/en/about-claude/pricing" target="_blank">Anthropic published API pricing</a>.</div>
+</div>
+<div id="modalBg" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal" id="modal"></div>
 </div>
 <script>
 const $=s=>document.querySelector(s);let AV=null;
-async function init(){try{const r=await fetch('/api/availability');AV=await r.json();if(!AV.first_date){$('#avail').innerHTML='No Claude Code session logs found in <code>~/.claude/projects/</code>. Use Claude Code first, then come back.';return}const n=AV.active_dates.length;const span=Math.round((new Date(AV.last_date)-new Date(AV.first_date))/864e5)+1;$('#avail').innerHTML=`Your logs cover <strong>${AV.first_date}</strong> to <strong>${AV.last_date}</strong> (${n} active days across ${span} calendar days, ${AV.total_files} session files). Use the date picker to filter within this range.`;$('#df').min=AV.first_date;$('#df').max=AV.last_date;$('#dt').min=AV.first_date;$('#dt').max=AV.last_date;$('#dt').value=AV.last_date;preset(30)}catch(e){$('#avail').textContent='Error: '+e.message}}
+const PRIVACY_KEY='cc-analyzer-privacy';
+const BANNER_KEY='cc-analyzer-banner-dismissed';
+
+function isPrivacy(){return localStorage.getItem(PRIVACY_KEY)==='1'}
+function setPrivacy(v){localStorage.setItem(PRIVACY_KEY, v?'1':'0');$('#privacy').checked=v;document.getElementById('privacyToggle').classList.toggle('on',v);run()}
+$('#privacy').addEventListener('change',e=>setPrivacy(e.target.checked));
+
+async function init(){
+  $('#privacy').checked=isPrivacy();document.getElementById('privacyToggle').classList.toggle('on',isPrivacy());
+  try{const r=await fetch('/api/availability');AV=await r.json();
+    if(!AV.first_date){$('#avail').innerHTML='No Claude Code session logs found in <code>~/.claude/projects/</code>. Use Claude Code first, then come back.';return}
+    const n=AV.active_dates.length;const span=Math.round((new Date(AV.last_date)-new Date(AV.first_date))/864e5)+1;
+    const ret=AV.retention||{};
+    const retNote=ret.days?(ret.is_default
+      ?` Claude Code keeps the last <strong>${ret.days} days</strong> locally by default — older sessions auto-rotate. Bump <code>cleanupPeriodDays</code> in <code>~/.claude/settings.json</code> if you want a longer history.`
+      :` Your <code>cleanupPeriodDays</code> is set to <strong>${ret.days} days</strong>. Older sessions auto-rotate.`):'';
+    $('#avail').innerHTML=`Logs cover <strong>${AV.first_date}</strong> to <strong>${AV.last_date}</strong> (${n} active days across ${span} calendar days, ${AV.total_files} session files).${retNote}`;
+    $('#df').min=AV.first_date;$('#df').max=AV.last_date;$('#dt').min=AV.first_date;$('#dt').max=AV.last_date;$('#dt').value=AV.last_date;
+    preset(30)
+  }catch(e){$('#avail').textContent='Error: '+e.message}
+}
 function preset(days){document.querySelectorAll('.bg').forEach(b=>b.classList.remove('active'));if(event&&event.target&&event.target.classList)event.target.classList.add('active');if(!AV||!AV.first_date)return;if(days===0){$('#df').value=AV.first_date;$('#dt').value=AV.last_date}else{const d=new Date(AV.last_date);d.setDate(d.getDate()-days);const m=new Date(AV.first_date);$('#df').value=(d<m?AV.first_date:d.toISOString().slice(0,10));$('#dt').value=AV.last_date}run()}
-async function run(){const from=$('#df').value,to=$('#dt').value;if(!from||!to)return;$('#status').textContent='Scanning...';$('#loading').classList.remove('hidden');$('#loading').textContent='Analyzing sessions...';$('#dash').classList.add('hidden');try{const r=await fetch(`/api/analyze?from=${from}&to=${to}`);const d=await r.json();if(d.error){$('#loading').textContent=d.error;$('#status').textContent='';return}render(d);$('#dash').classList.remove('hidden');$('#loading').classList.add('hidden');$('#status').textContent=d.summary.sessions+' sessions'}catch(e){$('#loading').textContent='Error: '+e.message;$('#status').textContent=''}}
-function fmt(n){return n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':n.toString()}
+async function run(){
+  const from=$('#df').value,to=$('#dt').value;if(!from||!to)return;
+  CATEGORY_FILTER=null;  // reset when re-running with new dates
+  $('#status').textContent='Scanning...';$('#loading').classList.remove('hidden');$('#loading').textContent='Analyzing sessions...';$('#dash').classList.add('hidden');
+  try{const url=`/api/analyze?from=${from}&to=${to}${isPrivacy()?'&privacy=1':''}`;
+    const r=await fetch(url);const d=await r.json();
+    if(d.error){$('#loading').textContent=d.error;$('#status').textContent='';return}
+    render(d);$('#dash').classList.remove('hidden');$('#loading').classList.add('hidden');$('#status').textContent=d.summary.sessions+' sessions';
+    maybeShowBanner(d);
+  }catch(e){$('#loading').textContent='Error: '+e.message;$('#status').textContent=''}
+}
+
+function maybeShowBanner(d){
+  if(localStorage.getItem(BANNER_KEY)==='1'){return}
+  const b=$('#banner');b.classList.remove('hidden');
+  b.className='banner';
+  b.innerHTML=`<div><h4>On Claude Pro or Max?</h4><p>The dollar amounts below are <strong>API-equivalent</strong> — what your usage would cost at API rates. Pro ($20/mo) and Max ($100-200/mo) are flat-fee, so this is <em>not</em> your actual bill. Useful for comparing across periods or spotting expensive patterns, not for predicting your invoice.</p></div><button onclick="dismissBanner()" title="Dismiss">×</button>`;
+}
+function dismissBanner(){localStorage.setItem(BANNER_KEY,'1');$('#banner').classList.add('hidden')}
+
+function fmt(n){return n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n))}
 function fC(n){return n>=1?'$'+n.toFixed(2):n>=.01?'$'+n.toFixed(3):'$'+n.toFixed(4)}
 function pct(n){return(n*100).toFixed(1)+'%'}
+function pctR(n){return Math.round(n*100)+'%'}
 function sc(s){return s>=75?'var(--green)':s>=55?'var(--blue)':s>=35?'var(--yellow)':s>=20?'var(--orange)':'var(--red)'}
-function tb(s){return s>=75?'var(--green-dim)':s>=55?'var(--blue-dim)':s>=35?'var(--yellow-dim)':'var(--orange-dim)'}
-function rR(arr){if(!arr||!arr.length)return'';let h='<div class="srecs">';for(const r of arr)h+=`<div class="rec rec-${r.type}"><h4>${r.title}</h4><p>${r.body}</p></div>`;return h+'</div>'}
-function render(d){
-  const s=d.summary,e=d.efficiency,S=d.scores,R=d.recs||{},sh=d.session_health||{};
-  let h='';
+function catClass(c){return 'cat-'+(c||'other').toLowerCase().replace(/[^a-z]/g,'-').replace(/--+/g,'-')}
+function escHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 
-  // ── Score Section ──
-  h+=`<div class="score-section">
-    <div class="score-card"><div class="score-num" style="color:${sc(S.usage)}">${S.usage}</div><div class="score-label">Usage</div><div class="score-sub" style="color:${sc(S.usage)}">${S.usage_label}</div><div class="score-subdesc">${S.usage_desc}</div></div>
-    <div class="score-op">+</div>
-    <div class="score-card"><div class="score-num" style="color:${sc(S.efficiency)}">${S.efficiency}</div><div class="score-label">Efficiency</div><div class="score-sub" style="color:${sc(S.efficiency)}">${S.eff_label}</div><div class="score-subdesc">${S.eff_desc}</div></div>
-    <div class="score-op">=</div>
-    <div class="score-card main"><div class="score-num big" style="color:${sc(S.composite)}">${S.composite}</div><div class="score-label">Overall Score</div><div class="score-sub" style="color:${sc(S.composite)}">${S.tier}</div><div class="score-subdesc">${S.description}</div></div>
+function rR(arr,kind){if(!arr||!arr.length)return'';return arr.map(r=>`<div class="rec rec-${kind}"><h4>${escHtml(r.title)}${r.savings?`<span class="savings">~${fC(r.savings)}</span>`:''}</h4><p>${r.body}</p></div>`).join('')}
+
+// ── Hero ──
+function renderHero(d){
+  const s=d.summary,e=d.efficiency,sc_=d.scores,tf=d.top_finding;
+  let action=tf?`<strong>${escHtml(tf.headline)}.</strong> ${escHtml(tf.action)}`:'No clear single action — your usage looks balanced. See targets and recommendations below for incremental tuning.';
+  const headline=d.hero_headline||`${fC(s.total_cost)} across ${s.sessions} sessions.`;
+  let h=`<div class="hero">
+    <div class="hero-headline">${escHtml(headline)}</div>
+    <div class="hero-action">${action}</div>
+    <div class="hero-stats">
+      <div class="hero-stat"><div class="v">${fC(s.total_cost)}</div><div class="l">Period spend</div><div class="s">~${fC(e.projected_monthly)}/mo · ${fC(e.projected_yearly)}/yr</div></div>
+      <div class="hero-stat"><div class="v">${s.total_hours}h</div><div class="l">Active hours</div><div class="s">${s.sessions} sessions · ${s.total_user_msgs+s.total_asst_msgs} messages</div></div>
+      <div class="hero-stat"><div class="v">${pctR(e.cache_hit_rate)}</div><div class="l">Cache reuse</div><div class="s">${fmt(s.total_tokens)} tokens processed</div></div>
+      <div class="hero-stat"><div class="v">${d.period.active_days} of ${d.period.days}</div><div class="l">Days active</div><div class="s">${(s.total_user_msgs+s.total_asst_msgs)/Math.max(d.period.active_days,1)|0} msgs/active day</div></div>
+    </div>
+    <div class="hero-profile"><strong>${sc_.composite_band}</strong> · ${sc_.usage_band.toLowerCase()} usage · ${sc_.efficiency_band.toLowerCase()} efficiency</div>
   </div>`;
+  return h;
+}
 
-  // ── Summary Cards ──
-  h+=`<div class="cards"><div class="card"><div class="v">${fC(s.total_cost)}</div><div class="l">Estimated Cost</div><div class="s">${fC(e.projected_monthly)}/mo projected</div></div><div class="card"><div class="v">${s.sessions}</div><div class="l">Sessions</div><div class="s">${e.avg_duration_min.toFixed(0)} min avg</div></div><div class="card"><div class="v">${fmt(s.total_tokens)}</div><div class="l">Total Tokens</div><div class="s">${fmt(s.tokens_output)} output</div></div><div class="card"><div class="v">${s.total_user_msgs+s.total_asst_msgs}</div><div class="l">Messages</div><div class="s">${s.total_tool_calls} tool calls</div></div></div>`;
+// ── Color key ──
+function renderColorKey(){
+  return `<div class="color-key">
+    <span class="key-item"><span class="ck" style="background:var(--green)"></span> Going well</span>
+    <span class="key-item"><span class="ck" style="background:var(--orange)"></span> Top opportunity</span>
+    <span class="key-item"><span class="ck" style="background:var(--yellow)"></span> Worth checking</span>
+    <span class="key-item"><span class="ck" style="background:var(--blue)"></span> Informational</span>
+    <span class="key-item" style="margin-left:auto;color:var(--dim)">Click any session label for a turn-by-turn breakdown</span>
+  </div>`;
+}
 
-  // ── Where Your Money Goes ──
-  const cb=d.cost_breakdown||{};
-  const cbTotal=(cb.input||0)+(cb.output||0)+(cb.cache_read||0)+(cb.cache_write||0);
-  if(cbTotal>0){
-    h+='<div class="panel" style="margin-bottom:20px"><h3>Where Your Money Goes</h3><p class="panel-sub">Cost breakdown by token type</p>';
-    const pI=(cb.input/cbTotal)*100,pO=(cb.output/cbTotal)*100,pCR=(cb.cache_read/cbTotal)*100,pCW=(cb.cache_write/cbTotal)*100;
-    h+=`<div style="display:flex;height:32px;border-radius:6px;overflow:hidden;margin-bottom:16px">`;
-    if(pCR>1)h+=`<div style="width:${pCR}%;background:#3b82f6;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Cache Reads: ${fC(cb.cache_read)}">${pCR>8?'Cache Read':''}</div>`;
-    if(pCW>1)h+=`<div style="width:${pCW}%;background:#f97316;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Cache Writes: ${fC(cb.cache_write)}">${pCW>8?'Cache Write':''}</div>`;
-    if(pO>1)h+=`<div style="width:${pO}%;background:#16a34a;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Output: ${fC(cb.output)}">${pO>5?'Output':''}</div>`;
-    if(pI>1)h+=`<div style="width:${pI}%;background:#6366f1;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Input: ${fC(cb.input)}">${pI>5?'Input':''}</div>`;
-    h+=`</div>`;
-    h+=`<div style="display:flex;gap:24px;flex-wrap:wrap">`;
-    h+=costLegend('#3b82f6','Cache Reads',cb.cache_read,pCR,'Re-reading your conversation history each turn');
-    h+=costLegend('#f97316','Cache Writes',cb.cache_write,pCW,'Loading new files, tool results, or context');
-    h+=costLegend('#16a34a','Output',cb.output,pO,"Claude's responses to you");
-    h+=costLegend('#6366f1','Input',cb.input,pI,'Your prompts and instructions');
-    h+='</div>';
-    // Context window explanation
-    const cachePct=pCR+pCW;
-    if(cachePct>70){
-      h+=`<div class="rec rec-info" style="margin-top:14px"><h4>Why is ${cachePct.toFixed(0)}% of your cost in cache?</h4><p>Every time you send a message, Claude re-reads your <strong>entire conversation history</strong> — every prior message, every file it read, every tool result. With the 1M context window model, sessions can grow very long, and Claude reprocesses all of that context on <em>every single turn</em>.</p><p style="margin-top:6px">Early in a session, this is cheap (small context). But by message 100+, Claude may be re-reading 500K+ tokens of history each turn. That's where your cost accumulates — not from Claude's responses (only ${pO.toFixed(0)}% of cost), but from re-reading the conversation over and over.</p><p style="margin-top:6px"><strong>What you can do:</strong> Start fresh sessions when switching tasks. Use <code>/clear</code> to reset context mid-session. The 1M window is powerful for deep work, but leaving stale context loaded means you're paying to re-read things Claude no longer needs.</p></div>`;
-    }
-    h+='</div>';
+// ── Targets ──
+function renderTargets(targets){
+  if(!targets||!targets.length)return'';
+  let h='<div class="panel" style="margin-bottom:20px"><h3>Goals</h3><p class="panel-sub">Where you stand on a few key metrics. The vertical line is the target.</p>';
+  for(const t of targets){
+    let val=t.value,target=t.target,fillW=0,markerW=0,disp,targetDisp,onTrack=false;
+    if(t.fmt==='pct'){val=Math.min(t.value,1);target=Math.min(t.target,1);fillW=val*100;markerW=target*100;disp=pctR(t.value);targetDisp='≥'+pctR(t.target);onTrack=t.value>=t.target}
+    else if(t.fmt==='pct_inv'){val=Math.min(t.value,1);target=Math.min(t.target,1);fillW=val*100;markerW=target*100;disp=pctR(t.value);targetDisp='≤'+pctR(t.target);onTrack=t.value<=t.target}
+    else if(t.fmt==='days'){const cap=7;fillW=Math.min(t.value/cap,1)*100;markerW=Math.min(t.target/cap,1)*100;disp=t.value.toFixed(1)+'d/wk';targetDisp='≥'+t.target+'d/wk';onTrack=t.value>=t.target}
+    else if(t.fmt==='msgs'){const cap=Math.max(t.target*2,30);fillW=Math.min(t.value/cap,1)*100;markerW=Math.min(t.target/cap,1)*100;disp=t.value.toFixed(0);targetDisp='≥'+t.target;onTrack=t.value>=t.target}
+    const color=onTrack?'var(--green)':'var(--orange)';
+    h+=`<div class="target"><div class="target-h"><div class="lbl">${escHtml(t.name)} <span style="color:${color}">${onTrack?'✓':'·'}</span></div><div class="val">${disp} <span style="color:var(--dim);margin-left:6px">target ${targetDisp}</span></div></div><div class="target-bar"><div class="target-fill" style="width:${fillW}%;background:${color}"></div><div class="target-marker" style="left:${markerW}%"></div></div><div class="target-tip">${escHtml(t.tip)}</div></div>`;
   }
+  return h+'</div>';
+}
 
-  // ── By Project ──
-  const proj=d.projects||[];
-  if(proj.length>=1){
-    h+='<div class="panel" style="margin-bottom:20px"><h3>By Project</h3><p class="panel-sub">'+
-      (proj.length>1?'Where you\'re spending across different projects':'All sessions are from a single working directory')+'</p>';
-    // Cost bar chart (only if multiple projects)
-    if(proj.length>1){
-      const mxC=proj[0].cost;
-      h+='<div style="margin-bottom:16px">';
-      for(const p of proj){
-        const w=mxC>0?Math.max((p.cost/mxC)*100,3):0;
-        h+=`<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">`;
-        h+=`<div style="width:160px;font-size:12px;text-align:right;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${p.name}">${p.name}</div>`;
-        h+=`<div style="flex:1;height:24px;background:var(--s3);border-radius:4px;overflow:hidden">`;
-        h+=`<div style="height:100%;width:${w}%;background:var(--accent);border-radius:4px;display:flex;align-items:center;padding-left:8px;font-size:10px;font-weight:600;color:#fff;min-width:fit-content">${w>15?fC(p.cost):''}</div>`;
-        h+=`</div>`;
-        h+=`<div style="width:55px;font-size:12px;font-weight:600;text-align:right">${fC(p.cost)}</div>`;
-        h+=`<div style="width:45px;font-size:10px;color:var(--dim);text-align:right">${pct(p.cost_pct)}</div>`;
-        h+=`</div>`;
-      }
-      h+='</div>';
-    }
-    // Detail table
-    h+='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px">';
-    h+='<thead><tr style="border-bottom:2px solid var(--border);text-align:left">';
-    h+='<th style="padding:6px 8px;color:var(--muted);font-weight:600">Project</th>';
-    h+='<th style="padding:6px 8px;color:var(--muted);font-weight:600;text-align:right">Cost</th>';
-    h+='<th style="padding:6px 8px;color:var(--muted);font-weight:600;text-align:right">Sessions</th>';
-    h+='<th style="padding:6px 8px;color:var(--muted);font-weight:600;text-align:right">Messages</th>';
-    h+='<th style="padding:6px 8px;color:var(--muted);font-weight:600;text-align:right">Reads</th>';
-    h+='<th style="padding:6px 8px;color:var(--muted);font-weight:600;text-align:right">Writes</th>';
-    h+='<th style="padding:6px 8px;color:var(--muted);font-weight:600;text-align:right">Ext Calls</th>';
-    h+='<th style="padding:6px 8px;color:var(--muted);font-weight:600;text-align:right">Efficiency</th>';
-    h+='</tr></thead><tbody>';
-    for(const p of proj){
-      const ec=sc(p.efficiency);
-      h+=`<tr style="border-bottom:1px solid var(--border)">`;
-      h+=`<td style="padding:8px;font-weight:500" title="${p.name}">${p.name}</td>`;
-      h+=`<td style="padding:8px;text-align:right;font-weight:600">${fC(p.cost)}</td>`;
-      h+=`<td style="padding:8px;text-align:right">${p.sessions}</td>`;
-      h+=`<td style="padding:8px;text-align:right">${p.messages}</td>`;
-      h+=`<td style="padding:8px;text-align:right">${p.reads}</td>`;
-      h+=`<td style="padding:8px;text-align:right">${p.writes}</td>`;
-      h+=`<td style="padding:8px;text-align:right">${p.mcp_calls}</td>`;
-      h+=`<td style="padding:8px;text-align:right"><span style="color:${ec};font-weight:600">${p.efficiency}</span></td>`;
-      h+=`</tr>`;
-    }
-    h+='</tbody></table></div>';
-    if(proj.length===1){h+=`<p style="font-size:11px;color:var(--dim);margin-top:10px;line-height:1.5">Tip: Launch Claude Code from specific project directories (<code>cd ~/Projects/my-app && claude</code>) to get per-project cost tracking. Right now all sessions share a single working directory.</p>`}
-    h+='</div>';
+// ── Recs ──
+function renderRecs(R){
+  const sortBySavings=(a,b)=>(b.savings||0)-(a.savings||0);
+  const primary=(R.primary||[]).slice().sort(sortBySavings);
+  const secondary=(R.secondary||[]).slice().sort(sortBySavings);
+  const good=(R.good||[]);
+  const PRIMARY_CAP=3,SECONDARY_CAP=3;
+  const primaryTop=primary.slice(0,PRIMARY_CAP),primaryRest=primary.slice(PRIMARY_CAP);
+  const secondaryTop=secondary.slice(0,SECONDARY_CAP),secondaryRest=secondary.slice(SECONDARY_CAP);
+  let h='<div class="cols">';
+  h+='<div class="panel"><h3>Where to focus</h3><p class="panel-sub">Top opportunities, ranked by estimated savings</p>';
+  h+=primaryTop.length?rR(primaryTop,'primary'):'<p style="font-size:12px;color:var(--muted)">No major issues. See smaller items below.</p>';
+  if(secondaryTop.length){
+    h+='<div style="margin-top:14px;font-size:11px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px">Smaller items</div>';
+    h+=rR(secondaryTop,'info');
   }
-
-  // ── What's Working & What to Improve (two columns) ──
-  const allRecs=[...(R.efficiency||[]),...(R.models||[]),...(R.health||[]),...(R.tools||[]),...(R.daily||[])];
-  const good=allRecs.filter(r=>r.type==='good');
-  const improve=allRecs.filter(r=>r.type==='warn'||r.type==='info');
-
-  h+='<div class="cols">';
-  h+='<div class="panel"><h3>What You\'re Doing Well</h3><p class="panel-sub">Keep these habits</p>';
-  if(good.length){for(const r of good)h+=`<div class="rec rec-good"><h4>${r.title}</h4><p>${r.body}</p></div>`}
-  else h+='<p style="font-size:12px;color:var(--muted)">No strong signals yet — use Claude more to build a pattern.</p>';
-  h+='</div>';
-
-  h+='<div class="panel"><h3>Where You Can Improve</h3><p class="panel-sub">Actionable ways to be more efficient</p>';
-  if(improve.length){for(const r of improve)h+=`<div class="rec rec-${r.type}"><h4>${r.title}</h4><p>${r.body}</p></div>`}
-  else h+='<p style="font-size:12px;color:var(--muted)">No issues detected — your usage looks efficient.</p>';
-  h+='</div></div>';
-
-  // ── How You Use Claude (two columns: Activity Breakdown + Cost by Service) ──
-  h+='<div class="cols">';
-
-  // Left: Activity breakdown as category summary bars
-  h+='<div class="panel"><h3>Activity Breakdown</h3><p class="panel-sub">What Claude spends its time doing</p>';
-  if(d.tools.length){
-    const cats={explore:0,create:0,mcp:0,other:0};
-    const exploreNames=['Read','Grep','Glob','Bash','WebSearch','WebFetch'];
-    const createNames=['Edit','Write','NotebookEdit'];
-    for(const t of d.tools){
-      if(exploreNames.includes(t.name))cats.explore+=t.count;
-      else if(createNames.includes(t.name))cats.create+=t.count;
-      else if(t.name.includes('::'))cats.mcp+=t.count;
-      else cats.other+=t.count;
-    }
-    const total=cats.explore+cats.create+cats.mcp+cats.other;
-    // Stacked bar for categories
-    const pe=(cats.explore/total)*100,pc=(cats.create/total)*100,pm=(cats.mcp/total)*100,po=(cats.other/total)*100;
-    h+=`<div style="display:flex;height:28px;border-radius:6px;overflow:hidden;margin-bottom:16px">`;
-    if(pe>1)h+=`<div style="width:${pe}%;background:var(--blue);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff">${pe>10?'Reading & Searching':''}</div>`;
-    if(pc>1)h+=`<div style="width:${pc}%;background:var(--green);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff">${pc>10?'Writing & Editing':''}</div>`;
-    if(pm>1)h+=`<div style="width:${pm}%;background:var(--orange);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff">${pm>8?'External Services':''}</div>`;
-    if(po>1)h+=`<div style="width:${po}%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff">${po>8?'Other':''}</div>`;
-    h+=`</div>`;
-    h+=`<div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:14px">`;
-    h+=actLegend('var(--blue)','Reading & Searching',cats.explore,pe,'Browsing files, searching code, running commands');
-    h+=actLegend('var(--green)','Writing & Editing',cats.create,pc,'Creating and modifying files');
-    h+=actLegend('var(--orange)','External Services',cats.mcp,pm,'Slack, Snowflake, Google Docs, Figma, etc.');
-    h+=actLegend('var(--accent)','Other',cats.other,po,'Task management, planning, subagents');
-    h+=`</div>`;
-    // Read:Write insight
-    const rwR=cats.explore>0&&cats.create>0?(cats.explore/cats.create).toFixed(1):'N/A';
-    h+=`<p style="font-size:11px;color:var(--muted);line-height:1.5">For every file you edit, Claude reads about <strong>${rwR}</strong> files first. ${cats.create>0&&cats.explore/cats.create<=4?'This is a healthy balance — reading before writing.':'A high ratio may mean a lot of exploration without producing output.'}</p>`;
+  const restCount=primaryRest.length+secondaryRest.length;
+  if(restCount>0){
+    h+=`<details style="margin-top:10px"><summary style="cursor:pointer;font-size:11px;color:var(--muted);font-weight:600">+ ${restCount} more</summary><div style="margin-top:8px">`;
+    h+=rR(primaryRest,'primary');
+    h+=rR(secondaryRest,'info');
+    h+='</div></details>';
   }
   h+='</div>';
-
-  // Right: Model mix + Heaviest external services
-  h+='<div class="panel"><h3>Cost by Model & Service</h3><p class="panel-sub">Which models and integrations cost the most</p>';
-  if(d.models.length){
-    h+='<div style="margin-bottom:6px;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Model</div>';
-    const mx=d.models[0].tokens;
-    for(const m of d.models){
-      if(!m.tokens)continue;
-      let nm=m.model.replace('claude-','').replace(/-20\d{6}$/,'');
-      // Make model names friendlier
-      if(nm.includes('opus'))nm='Opus (most capable, $5/$25 per MTok)';
-      else if(nm.includes('sonnet'))nm='Sonnet (balanced, $3/$15 per MTok)';
-      else if(nm.includes('haiku'))nm='Haiku (fastest, $1/$5 per MTok)';
-      const c=m.model.includes('opus')?'var(--orange)':m.model.includes('haiku')?'var(--green)':'var(--blue)';
-      h+=`<div class="br"><div class="bl" title="${m.model}" style="width:140px;text-align:left">${nm}</div><div class="bt"><div class="bf" style="width:${(m.tokens/mx)*100}%;background:${c}">${pct(m.pct)}</div></div><div class="bv" style="width:90px">${fC(m.cost)}</div></div>`;
-    }
-  }
-  if(sh.mcp_heavy_tools&&sh.mcp_heavy_tools.length){
-    h+='<div style="margin-top:18px;margin-bottom:6px;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Heaviest External Services</div>';
-    h+='<p style="font-size:11px;color:var(--dim);margin-bottom:8px">Estimated tokens consumed by data returned from each service</p>';
-    const mxMcp=sh.mcp_heavy_tools[0][1];
-    // Map technical names to friendly names
-    const friendly={'playwright::browser_take_screenshot':'Screenshots (Playwright)','granola::get_meeting_transcript':'Meeting Transcripts (Granola)','google-workspace::readGoogleDoc':'Google Docs','figma::get_screenshot':'Figma Screenshots','snowflake::run_snowflake_query':'Snowflake Queries','snowflake::list_objects':'Snowflake Schema','slack::slack_read_thread':'Slack Threads','slack::slack_search_public':'Slack Search','glean_default::read_document':'Glean Documents','glean_default::search':'Glean Search'};
-    for(const [name,tok] of sh.mcp_heavy_tools){
-      const display=friendly[name]||name;
-      const label=tok>=1e3?((tok/1e3).toFixed(0)+'K'):String(tok);
-      const estCost=tok*6.25/1e6;
-      const barW=Math.max((tok/mxMcp)*100,8);
-      h+=`<div class="br"><div class="bl" title="${name}" style="width:140px;text-align:left">${display}</div><div class="bt"><div class="bf" style="width:${barW}%;background:var(--orange)">${barW>30?label:''}</div></div><div class="bv" style="width:90px">${label} ~${fC(estCost)}</div></div>`;
-    }
-  }
+  h+='<div class="panel"><h3>Going well</h3><p class="panel-sub">Habits worth keeping</p>';
+  h+=good.length?rR(good,'good'):'<p style="font-size:12px;color:var(--muted)">No strong positive signals yet — use Claude more to build a pattern.</p>';
   h+='</div></div>';
+  return h;
+}
 
-  // ── Daily Cost ──
-  h+='<div class="panel" style="margin-bottom:20px"><h3>Daily Spend</h3><p class="panel-sub">How much you spent each day</p>';
-  if(d.daily.length){
-    const mx=Math.max(...d.daily.map(x=>x.cost));
-    const show=d.daily.length>14?d.daily.slice(-14):d.daily;
-    if(d.daily.length>14)h+=`<p style="font-size:11px;color:var(--dim);margin-bottom:8px">Showing last 14 days of ${d.daily.length}</p>`;
-    for(const day of show){const lb=day.date.slice(5);const w=mx>0?(day.cost/mx)*100:0;const c=day.cost>100?'var(--orange)':day.cost>30?'var(--blue)':'var(--green)';h+=`<div class="br"><div class="bl">${lb}</div><div class="bt"><div class="bf" style="width:${w}%;background:${c}">${day.cost>=1?fC(day.cost):''}</div></div><div class="bv">${day.sessions}s ${day.msgs}m</div></div>`}
+// ── Money ──
+function renderMoney(cb){
+  const cw=(cb.cache_write_5m||0)+(cb.cache_write_1h||0);
+  const total=(cb.input||0)+(cb.output||0)+(cb.cache_read||0)+cw+(cb.web_search||0);
+  if(total<=0)return'';
+  const pI=(cb.input/total)*100,pO=(cb.output/total)*100,pCR=(cb.cache_read/total)*100,pCW=(cw/total)*100,pWS=((cb.web_search||0)/total)*100;
+  let h='<div class="panel" style="margin-bottom:20px"><h3>Where the money goes</h3><p class="panel-sub">Cost split by token type</p>';
+  h+='<div style="display:flex;height:32px;border-radius:6px;overflow:hidden;margin-bottom:16px">';
+  if(pCR>1)h+=`<div style="width:${pCR}%;background:#3b82f6;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Cache reads: ${fC(cb.cache_read)}">${pCR>8?'Cache reads':''}</div>`;
+  if(pCW>1)h+=`<div style="width:${pCW}%;background:#f97316;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Cache writes: ${fC(cw)}">${pCW>8?'Cache writes':''}</div>`;
+  if(pO>1)h+=`<div style="width:${pO}%;background:#16a34a;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Output: ${fC(cb.output)}">${pO>5?'Output':''}</div>`;
+  if(pI>1)h+=`<div style="width:${pI}%;background:#6366f1;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Input: ${fC(cb.input)}">${pI>5?'Input':''}</div>`;
+  if(pWS>0.5)h+=`<div style="width:${pWS}%;background:#a855f7;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Web search: ${fC(cb.web_search)}">${pWS>5?'Web':''}</div>`;
+  h+='</div><div style="display:flex;gap:24px;flex-wrap:wrap">';
+  h+=cl('#3b82f6','Cache reads',cb.cache_read,pCR,'Re-reading conversation history each turn');
+  h+=cl('#f97316','Cache writes',cw,pCW,'Loading new files, tool results, system context');
+  h+=cl('#16a34a','Output',cb.output,pO,"Claude's responses to you");
+  h+=cl('#6366f1','Input',cb.input,pI,'Your prompts and instructions');
+  if((cb.web_search||0)>0)h+=cl('#a855f7','Web search',cb.web_search,pWS,'$10 per 1,000 web_search calls');
+  h+='</div>';
+  const cachePct=pCR+pCW;
+  if(cachePct>70){
+    h+=`<details style="margin-top:14px"><summary style="cursor:pointer;font-size:12px;color:var(--blue);font-weight:600">Why is ${cachePct.toFixed(0)}% of your spend in cache? &nbsp;<span style="color:var(--dim);font-weight:400">(click to expand)</span></summary><div class="rec rec-info" style="margin-top:8px"><p>Every message, Claude re-reads the <strong>entire conversation history</strong> — every prior turn, every file read, every tool result. The 1M context window (now standard pricing on Opus 4.6+ and Sonnet 4.6+) lets sessions grow long, and cost compounds with each new turn.</p><p style="margin-top:6px"><strong>Lever:</strong> Use <code>/clear</code> mid-session when you switch tasks. Start fresh sessions for unrelated work.</p></div></details>`;
   }
-  h+=rR(R.daily)+'</div>';
+  return h+'</div>';
+}
 
-  // ── Session Health ──
-  const healthRecs=(R.health||[]).filter(r=>!['Vague Prompts','Specific Prompts','Frequent Agent Loops','Heavy Subagent Usage'].includes(r.title));
-  if(healthRecs.length){
-    h+='<div class="panel" style="margin-bottom:20px"><h3>Session Health</h3><p class="panel-sub">Potential waste patterns detected</p>';
-    h+=`<div style="display:flex;gap:24px;margin-bottom:14px;flex-wrap:wrap">`;
-    h+=miniStat('Clean Sessions',sh.clean_pct+'%',sh.clean_pct>=90?'var(--green)':sh.clean_pct>=70?'var(--blue)':'var(--yellow)');
-    h+=miniStat('Flagged',sh.flagged_count+' of '+s.sessions,sh.flagged_count<=2?'var(--green)':sh.flagged_count<=5?'var(--blue)':'var(--yellow)');
-    h+=miniStat('Interrupts',String(sh.total_interrupts),sh.total_interrupts<=5?'var(--green)':sh.total_interrupts<=15?'var(--blue)':'var(--yellow)');
-    h+=`</div>`;
-    h+=rR(healthRecs)+'</div>';
+function cl(color,label,cost,p,desc){return`<div style="display:flex;align-items:flex-start;gap:6px"><div style="width:10px;height:10px;border-radius:2px;background:${color};margin-top:3px;flex-shrink:0"></div><div><div style="font-size:12px"><span style="color:var(--muted)">${label}</span> <strong>${fC(cost)}</strong> <span style="font-size:11px;color:var(--dim)">(${p.toFixed(0)}%)</span></div><div style="font-size:10px;color:var(--dim)">${desc}</div></div></div>`}
+
+// ── External services (split panel) ──
+function renderExternal(sh){
+  if(!sh.mcp_heavy_tools||!sh.mcp_heavy_tools.length)return'';
+  let h='<div class="panel"><h3>External services</h3><p class="panel-sub">Estimated tokens consumed by data returned from each MCP tool</p>';
+  const mx=sh.mcp_heavy_tools[0].tokens;
+  for(const t of sh.mcp_heavy_tools){
+    const tok=t.tokens,label=tok>=1e3?((tok/1e3).toFixed(0)+'K'):String(tok);
+    const barW=Math.max((tok/mx)*100,8);
+    h+=`<div class="br"><div class="bl" title="${escHtml(t.name)}">${escHtml(t.friendly)}</div><div class="bt"><div class="bf" style="width:${barW}%;background:var(--orange)">${barW>30?label:''}</div></div><div class="bv">${label} ~${fC(t.est_cost)}</div></div>`;
   }
+  return h+'<p style="font-size:11px;color:var(--dim);margin-top:8px">Token cost is estimated using a conservative cache-write rate. Actual cost depends on the model used.</p></div>';
+}
 
-  // ── Trend ──
-  if(d.trend){
-    h+='<div class="panel" style="margin-bottom:20px"><h3>Trend vs. Prior Period</h3><p class="panel-sub">How your usage changed compared to the same-length prior window</p>';
-    h+=tR('Tokens/msg',d.trend.prev_tokens_per_msg,d.trend.curr_tokens_per_msg,true,v=>v.toFixed(0));
-    h+=tR('Cache rate',d.trend.prev_cache_rate,d.trend.curr_cache_rate,false,v=>pct(v));
-    h+=tR('Cost/session',d.trend.prev_cost_per_session,d.trend.curr_cost_per_session,true,v=>fC(v));
-    h+=tR('Total cost',d.trend.prev_total_cost,d.trend.curr_total_cost,true,v=>fC(v));
-    h+=tR('Sessions',d.trend.prev_sessions,d.trend.curr_sessions,false,v=>v.toString());
+// ── Models (split panel) ──
+function renderModels(d){
+  if(!d.models||!d.models.length)return'';
+  let h='<div class="panel"><h3>Models used</h3><p class="panel-sub">Token share and cost by model</p>';
+  const mx=d.models[0].tokens;
+  for(const m of d.models){if(!m.tokens)continue;
+    const c=m.model.includes('opus')?'var(--orange)':m.model.includes('haiku')?'var(--green)':'var(--blue)';
+    h+=`<div class="br"><div class="bl" title="${escHtml(m.model)}">${escHtml(m.friendly)}</div><div class="bt"><div class="bf" style="width:${(m.tokens/mx)*100}%;background:${c}">${pct(m.pct)}</div></div><div class="bv">${fC(m.cost)}</div></div>`;
+  }
+  return h+'</div>';
+}
+
+// ── Activity ──
+function renderActivity(d){
+  if(!d.tools||!d.tools.length)return'';
+  const cats={explore:0,create:0,mcp:0,other:0};
+  const eN=['Read','Grep','Glob','Bash','WebSearch','WebFetch'],cN=['Edit','Write','NotebookEdit'];
+  for(const t of d.tools){if(eN.includes(t.raw))cats.explore+=t.count;else if(cN.includes(t.raw))cats.create+=t.count;else if(t.raw&&t.raw.startsWith('mcp__'))cats.mcp+=t.count;else cats.other+=t.count}
+  const total=cats.explore+cats.create+cats.mcp+cats.other;
+  const pe=(cats.explore/total)*100,pc=(cats.create/total)*100,pm=(cats.mcp/total)*100,po=(cats.other/total)*100;
+  let h='<div class="panel"><h3>What Claude was doing</h3><p class="panel-sub">Tool calls grouped by activity type</p>';
+  h+='<div style="display:flex;height:28px;border-radius:6px;overflow:hidden;margin-bottom:16px">';
+  if(pe>1)h+=`<div style="width:${pe}%;background:var(--blue);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff">${pe>10?'Reading':''}</div>`;
+  if(pc>1)h+=`<div style="width:${pc}%;background:var(--green);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff">${pc>10?'Writing':''}</div>`;
+  if(pm>1)h+=`<div style="width:${pm}%;background:var(--orange);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff">${pm>8?'External':''}</div>`;
+  if(po>1)h+=`<div style="width:${po}%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff">${po>8?'Other':''}</div>`;
+  h+='</div><div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:14px">';
+  h+=al('var(--blue)','Reading & searching',cats.explore,pe);
+  h+=al('var(--green)','Writing & editing',cats.create,pc);
+  h+=al('var(--orange)','External services',cats.mcp,pm);
+  h+=al('var(--accent)','Other',cats.other,po);
+  h+='</div>';
+  const rwR=cats.explore>0&&cats.create>0?(cats.explore/cats.create).toFixed(1):'N/A';
+  h+=`<p style="font-size:11px;color:var(--muted)">For every file edited, Claude read about <strong>${rwR}</strong> first.</p></div>`;
+  return h;
+}
+
+function al(color,label,count,p){return`<div style="display:flex;align-items:flex-start;gap:6px"><div style="width:10px;height:10px;border-radius:2px;background:${color};margin-top:3px;flex-shrink:0"></div><div><div style="font-size:12px"><span style="color:var(--muted)">${label}</span> <strong>${count}</strong> <span style="font-size:11px;color:var(--dim)">(${p.toFixed(0)}%)</span></div></div></div>`}
+
+// ── Categories ──
+function renderCategories(cats){
+  if(!cats||!cats.length||cats.length===1)return'';
+  let h='<div class="panel" style="margin-bottom:20px"><h3>What you used Claude Code for</h3><p class="panel-sub">Click a category to filter the Top 10 turns table below</p>';
+  const mx=cats[0].cost;
+  for(const c of cats){
+    const w=mx>0?Math.max((c.cost/mx)*100,3):0;
+    h+=`<div class="br" style="cursor:pointer" onclick="filterTurnsByCategory('${escHtml(c.name)}')"><div class="bl"><span class="cat-pill ${catClass(c.name)}">${escHtml(c.name)}</span></div><div class="bt"><div class="bf" style="width:${w}%;background:var(--accent)">${w>20?fC(c.cost):''}</div></div><div class="bv">${c.sessions} sess · ${fC(c.cost)}</div></div>`;
+  }
+  return h+'</div>';
+}
+
+// ── Best moments ──
+function renderBest(moments){
+  if(!moments||!moments.length)return'';
+  let h='<div class="panel" style="margin-bottom:20px"><h3>Best moments</h3><p class="panel-sub">Sessions worth celebrating</p>';
+  for(const m of moments){
+    const dur=Math.round(m.duration_min);
+    const hStr=dur>=60?`${Math.floor(dur/60)}h ${dur%60}m`:`${dur}m`;
+    h+=`<div style="padding:12px 0;border-bottom:1px solid var(--border)">
+      <div style="font-size:11px;font-weight:600;color:var(--green);text-transform:uppercase;letter-spacing:.3px">${escHtml(m.title)}</div>
+      <div style="display:flex;align-items:baseline;gap:12px;margin-top:6px;flex-wrap:wrap">
+        <div style="font-size:18px;font-weight:700;color:var(--text)">${hStr}</div>
+        <div style="font-size:13px;color:var(--muted)">${m.messages} messages · ${m.writes} writes</div>
+      </div>
+      <div style="font-size:13px;font-weight:600;margin-top:6px">${m.session_id?`<a class="session-link" onclick="openSession('${m.session_id}')">${escHtml(m.label)}</a>`:escHtml(m.label)}</div>
+      <div style="font-size:11px;color:var(--dim);margin-top:4px">
+        <span class="cat-pill ${catClass(m.category)}">${escHtml(m.category)}</span>
+        ${fC(m.cost)} spent
+      </div>
+    </div>`;
+  }
+  return h+'</div>';
+}
+
+// ── Top expensive turns (with optional category filter) ──
+let CATEGORY_FILTER=null;  // global filter state, mutated by category-pill clicks
+let LAST_DATA=null;        // cached so we can re-render without refetching
+
+function renderTopTurns(turns){
+  if(!turns||!turns.length)return'';
+  const driverFriendly={cache_read:'Cache read',cache_write:'Cache write',output:'Output',input:'Input',web_search:'Web search'};
+  const filtered=CATEGORY_FILTER?turns.filter(t=>t.session_category===CATEGORY_FILTER).slice(0,10):turns;
+  let h='<div class="panel" style="margin-bottom:20px" id="topTurnsPanel"><h3>Top 10 most expensive turns</h3><p class="panel-sub">Highest-cost single messages. Click a session to see its turn-by-turn breakdown.</p>';
+  if(CATEGORY_FILTER){
+    h+=`<div style="background:var(--blue-dim);color:var(--blue);padding:6px 12px;border-radius:6px;font-size:11px;margin-bottom:10px;display:inline-flex;align-items:center;gap:8px">Filtered to <strong>${escHtml(CATEGORY_FILTER)}</strong> <a onclick="clearTurnFilter()" style="cursor:pointer;text-decoration:underline">clear</a></div>`;
+  }
+  if(!filtered.length){
+    h+=`<p style="font-size:12px;color:var(--muted)">No turns matched this filter.</p></div>`;
+    return h;
+  }
+  h+='<div style="overflow-x:auto"><table class="tt"><thead><tr><th>#</th><th>Cost</th><th>Driver</th><th>Tool</th><th>Model</th><th>Session</th><th>When</th></tr></thead><tbody>';
+  filtered.forEach((t,i)=>{
+    const when=t.ts?t.ts.slice(0,16).replace('T',' '):'';
+    h+=`<tr><td>${i+1}</td><td style="font-weight:600">${fC(t.cost)}</td><td><span style="font-size:10px;color:var(--muted)">${driverFriendly[t.driver]||t.driver}</span></td><td>${escHtml(t.tool_friendly)}</td><td>${escHtml(t.model_friendly)}</td><td><a class="session-link" onclick="openSession('${t.session_id}')">${escHtml(t.session_label)}</a></td><td style="font-size:10px;color:var(--dim)">${when}</td></tr>`;
+  });
+  return h+'</tbody></table></div></div>';
+}
+
+function filterTurnsByCategory(cat){
+  CATEGORY_FILTER=(CATEGORY_FILTER===cat)?null:cat;
+  if(LAST_DATA){
+    render(LAST_DATA);
+    const panel=document.getElementById('topTurnsPanel');
+    if(panel)panel.scrollIntoView({behavior:'smooth',block:'start'});
+  }
+}
+function clearTurnFilter(){CATEGORY_FILTER=null;if(LAST_DATA)render(LAST_DATA)}
+
+// ── Bloat ──
+function renderBloat(curves){
+  if(!curves||!curves.length)return'';
+  let h='<div class="panel" style="margin-bottom:20px"><h3>Context bloat — top 3 sessions</h3><p class="panel-sub">Cache reads per turn over the life of each session. A rising staircase = stale context piling up.</p>';
+  for(const c of curves){
+    const mx=Math.max(...c.points.map(p=>p.cr),1);
+    h+=`<div style="margin-bottom:14px"><div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;gap:10px"><div style="font-size:12px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a class="session-link" onclick="openSession('${c.session_id}')">${escHtml(c.label)}</a></div><div style="font-size:11px;color:var(--muted);flex-shrink:0">${c.messages} msgs · avg ${fmt(c.avg_cache_read)} cache · ${fC(c.cost)}</div></div><div class="spark">`;
+    for(const p of c.points){const hp=Math.max((p.cr/mx)*100,1);h+=`<div class="b" style="height:${hp}%" title="turn ${p.idx}: ${fmt(p.cr)} cache read"></div>`}
+    h+='</div></div>';
+  }
+  return h+'<p style="font-size:11px;color:var(--dim);margin-top:6px">When the bars stop dropping back down between turns, the conversation has accumulated context that\'s no longer load-bearing. <code>/clear</code> resets it.</p></div>';
+}
+
+// ── Daily ──
+function renderDaily(daily){
+  if(!daily||!daily.length)return'';
+  let h='<div class="panel" style="margin-bottom:20px"><h3>Daily spend</h3><p class="panel-sub">How much you spent each day</p>';
+  const mx=Math.max(...daily.map(x=>x.cost),0.01);
+  const show=daily.length>14?daily.slice(-14):daily;
+  h+='<div style="display:flex;gap:14px;font-size:10px;color:var(--muted);margin-bottom:10px;flex-wrap:wrap">';
+  h+='<span style="display:inline-flex;align-items:center;gap:5px"><span style="width:9px;height:9px;border-radius:2px;background:var(--green)"></span>under $30</span>';
+  h+='<span style="display:inline-flex;align-items:center;gap:5px"><span style="width:9px;height:9px;border-radius:2px;background:var(--blue)"></span>$30–$100</span>';
+  h+='<span style="display:inline-flex;align-items:center;gap:5px"><span style="width:9px;height:9px;border-radius:2px;background:var(--orange)"></span>over $100</span>';
+  if(daily.length>14)h+=`<span style="margin-left:auto;color:var(--dim)">Showing last 14 days of ${daily.length}</span>`;
+  h+='</div>';
+  for(const day of show){const lb=day.date.slice(5);const w=mx>0?(day.cost/mx)*100:0;const c=day.cost>100?'var(--orange)':day.cost>30?'var(--blue)':day.cost>0?'var(--green)':'var(--dim)';h+=`<div class="br"><div class="bl">${lb}</div><div class="bt"><div class="bf" style="width:${w}%;background:${c}">${day.cost>=1?fC(day.cost):''}</div></div><div class="bv">${day.sessions}s · ${day.msgs}m</div></div>`}
+  return h+'</div>';
+}
+
+// ── Health ──
+function renderHealth(s,sh){
+  if(!sh.flagged_count&&!sh.skill_invocations&&!sh.plan_mode_uses&&!sh.truncated_turns)return'';
+  let h='<div class="panel" style="margin-bottom:20px"><h3>Session health signals</h3><p class="panel-sub">Useful counts for sanity-checking your usage</p>';
+  h+='<div style="display:flex;gap:18px;margin-bottom:8px;flex-wrap:wrap">';
+  h+=ms('Clean sessions',sh.clean_pct+'%',sh.clean_pct>=90?'var(--green)':sh.clean_pct>=70?'var(--blue)':'var(--yellow)');
+  h+=ms('Flagged',sh.flagged_count+' / '+s.sessions,sh.flagged_count<=2?'var(--green)':sh.flagged_count<=5?'var(--blue)':'var(--yellow)');
+  h+=ms('Interrupts',String(sh.total_interrupts),sh.total_interrupts<=5?'var(--green)':sh.total_interrupts<=15?'var(--blue)':'var(--yellow)');
+  if(sh.truncated_turns>0)h+=ms('Truncated',String(sh.truncated_turns),sh.truncated_turns<=2?'var(--green)':sh.truncated_turns<=10?'var(--blue)':'var(--orange)');
+  if(sh.plan_mode_uses>0)h+=ms('Plan mode',String(sh.plan_mode_uses),'var(--green)');
+  if(sh.skill_invocations>0)h+=ms('Skills run',String(sh.skill_invocations),'var(--blue)');
+  if(sh.subagent_spawns>0)h+=ms('Subagents',String(sh.subagent_spawns),'var(--blue)');
+  h+='</div>';
+  if(sh.top_skills&&sh.top_skills.length){
+    h+='<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)">Top skills: ';
+    h+=sh.top_skills.map(([n,c])=>`<span class="cat-pill" style="background:var(--blue-dim);color:var(--blue);margin-right:4px">${escHtml(n)} ×${c}</span>`).join('');
     h+='</div>';
   }
+  return h+'</div>';
+}
+function ms(label,val,color){return`<div class="miniStat"><div class="v" style="color:${color}">${val}</div><div class="l">${label}</div></div>`}
 
+// ── Trend ──
+function renderTrend(t){
+  if(!t)return'';
+  let h='<div class="panel" style="margin-bottom:20px"><h3>Compared to prior period</h3><p class="panel-sub">Same-length window before this one. <span style="color:var(--green)">Green</span> = the change is in your favor (lower cost per session, higher cache rate, more sessions). <span style="color:var(--orange)">Orange</span> = the opposite.</p>';
+  h+=tR('Tokens/msg',t.prev_tokens_per_msg,t.curr_tokens_per_msg,true,v=>v.toFixed(0));
+  h+=tR('Cache rate',t.prev_cache_rate,t.curr_cache_rate,false,v=>pct(v));
+  h+=tR('Cost/session',t.prev_cost_per_session,t.curr_cost_per_session,true,v=>fC(v));
+  h+=tR('Total cost',t.prev_total_cost,t.curr_total_cost,true,v=>fC(v));
+  h+=tR('Sessions',t.prev_sessions,t.curr_sessions,false,v=>v.toString());
+  return h+'</div>';
+}
+function tR(l,p,c,lib,fn){if(p===0)return`<div class="tr"><div class="tm">${l}</div><div class="tv">${fn(c)}</div><span class="ta ta-s">new</span></div>`;const pc=((c-p)/p)*100;let cls,txt;if(Math.abs(pc)<5){cls='ta-s';txt=`~${Math.abs(pc).toFixed(0)}%`}else if(pc>0){cls=lib?'ta-ub':'ta-ug';txt=`+${pc.toFixed(0)}%`}else{cls=lib?'ta-dg':'ta-db';txt=`${pc.toFixed(0)}%`}return`<div class="tr"><div class="tm">${l}</div><div class="tv">${fn(p)} &rarr; ${fn(c)}</div><span class="ta ${cls}">${txt}</span></div>`}
+
+// ── Score (small footer block) ──
+function renderScore(sc_,e){
+  return `<div style="display:flex;justify-content:center;margin-bottom:8px">
+    <div class="score-tile" style="border-color:${sc(sc_.composite)};max-width:340px;width:100%">
+      <div class="num" style="color:${sc(sc_.composite)}">${sc_.composite}</div>
+      <div class="lbl">Overall · ${sc_.composite_band}</div>
+      <div class="desc">Usage ${sc_.usage} (${sc_.usage_band.toLowerCase()}) · Efficiency ${sc_.efficiency} (${sc_.efficiency_band.toLowerCase()})</div>
+    </div>
+  </div>
+  <p style="font-size:10px;color:var(--dim);text-align:center;margin-bottom:20px">Composite of usage and efficiency, weighted to penalize being very high in one and very low in the other.</p>`;
+}
+
+// ── Projects (only shown when >1; single table with inline cost bar) ──
+function renderProjects(proj){
+  if(!proj||proj.length<2)return'';
+  const mxC=proj[0].cost;
+  let h='<div class="panel" style="margin-bottom:20px"><h3>By project</h3><p class="panel-sub">Where the spend went across working directories</p>';
+  h+='<table class="tt"><thead><tr><th>Project</th><th>Cost</th><th style="text-align:right">Sessions</th><th style="text-align:right">Messages</th><th style="text-align:right">Reads</th><th style="text-align:right">Writes</th><th style="text-align:right">External</th><th style="text-align:right">Eff.</th></tr></thead><tbody>';
+  for(const p of proj){
+    const ec=sc(p.efficiency);
+    const w=mxC>0?Math.max((p.cost/mxC)*100,3):0;
+    h+=`<tr><td title="${escHtml(p.name)}" style="font-weight:500">${escHtml(p.name)}</td>`;
+    h+=`<td style="min-width:200px"><div style="display:flex;align-items:center;gap:8px"><div style="flex:1;height:14px;background:var(--s3);border-radius:3px;overflow:hidden"><div style="height:100%;width:${w}%;background:var(--accent);border-radius:3px"></div></div><div style="font-weight:600;width:55px;text-align:right">${fC(p.cost)}</div><div style="font-size:10px;color:var(--dim);width:36px;text-align:right">${pctR(p.cost_pct)}</div></div></td>`;
+    h+=`<td style="text-align:right">${p.sessions}</td><td style="text-align:right">${p.messages}</td><td style="text-align:right">${p.reads}</td><td style="text-align:right">${p.writes}</td><td style="text-align:right">${p.mcp_calls}</td><td style="text-align:right;color:${ec};font-weight:600">${p.efficiency}</td></tr>`;
+  }
+  return h+'</tbody></table></div>';
+}
+
+// ── Empty state ──
+function renderEmptyState(d){
+  return `<div class="empty-state">
+    <h3>Just a handful of sessions so far</h3>
+    <p>Only ${d.summary.sessions} session(s) in the selected window. Insights get sharper once you've used Claude Code for a few weeks. The summary below still has data — it just won't reveal patterns yet.</p>
+    <p style="font-size:11px">Total spend: <strong>${fC(d.summary.total_cost)}</strong> · Active days: <strong>${d.period.active_days}</strong> · Cache hit rate: <strong>${pctR(d.efficiency.cache_hit_rate)}</strong></p>
+  </div>`;
+}
+
+// ── Render orchestration ──
+function render(d){
+  LAST_DATA=d;
+  let h='';
+  h+=renderHero(d);
+  h+=renderColorKey();
+  if(d.is_low_data){h+=renderEmptyState(d)}
+  h+='<div class="section-h">Goals & opportunities</div>';
+  h+=renderTargets(d.targets);
+  h+=renderRecs(d.recs||{});
+  h+='<div class="section-h">Where the money went</div>';
+  h+=renderMoney(d.cost_breakdown||{});
+  h+='<div class="cols">'+renderModels(d)+renderExternal(d.session_health||{})+'</div>';
+  if(d.best_moments&&d.best_moments.length){h+='<div class="section-h">Highlights</div>';h+=renderBest(d.best_moments)}
+  h+='<div class="section-h">How Claude Code got used</div>';
+  h+='<div class="cols">'+renderActivity(d)+renderCategories(d.categories)+'</div>';
+  h+=renderTopTurns(d.top_turns||[]);
+  h+=renderBloat(d.bloat_curves||[]);
+  h+=renderDaily(d.daily||[]);
+  h+=renderProjects(d.projects||[]);
+  h+='<div class="section-h">Diagnostics</div>';
+  h+=renderHealth(d.summary,d.session_health||{});
+  h+=renderTrend(d.trend);
+  h+='<div class="section-h">Score detail</div>';
+  h+=renderScore(d.scores,d.efficiency);
   $('#dash').innerHTML=h;
 }
 
-function costLegend(color,label,cost,pct,desc){return`<div style="display:flex;align-items:flex-start;gap:6px"><div style="width:10px;height:10px;border-radius:2px;background:${color};margin-top:3px;flex-shrink:0"></div><div><div style="font-size:12px"><span style="color:var(--muted)">${label}</span> <strong>${fC(cost)}</strong> <span style="font-size:11px;color:var(--dim)">(${pct.toFixed(0)}%)</span></div><div style="font-size:10px;color:var(--dim)">${desc}</div></div></div>`}
-function actLegend(color,label,count,pct,desc){return`<div style="display:flex;align-items:flex-start;gap:6px"><div style="width:10px;height:10px;border-radius:2px;background:${color};margin-top:3px;flex-shrink:0"></div><div><div style="font-size:12px"><span style="color:var(--muted)">${label}</span> <strong>${count}</strong> <span style="font-size:11px;color:var(--dim)">(${pct.toFixed(0)}%)</span></div><div style="font-size:10px;color:var(--dim)">${desc}</div></div></div>`}
-function bar(name,count,mx,color){return`<div class="br"><div class="bl" title="${name}">${name}</div><div class="bt"><div class="bf" style="width:${(count/mx)*100}%;background:${color}">${count}</div></div><div class="bv"></div></div>`}
-function miniStat(label,val,color){return`<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:${color}">${val}</div><div style="font-size:10px;color:var(--muted);margin-top:2px">${label}</div></div>`}
-function gauge(l,v,mx,disp,c){const w=Math.min((v/mx)*100,100);return`<div class="gr"><div class="gl">${l}</div><div class="gt"><div class="gf" style="width:${w}%;background:${c}"></div></div><div class="gv" style="color:${c}">${disp}</div></div>`}
-function tR(l,p,c,lib,fn){if(p===0)return`<div class="tr"><div class="tm">${l}</div><div class="tv">${fn(c)}</div><span class="ta ta-s">new</span></div>`;const pc=((c-p)/p)*100;let cls,txt;if(Math.abs(pc)<5){cls='ta-s';txt=`~${Math.abs(pc).toFixed(0)}%`}else if(pc>0){cls=lib?'ta-ub':'ta-ug';txt=`+${pc.toFixed(0)}%`}else{cls=lib?'ta-dg':'ta-db';txt=`${pc.toFixed(0)}%`}return`<div class="tr"><div class="tm">${l}</div><div class="tv">${fn(p)} &rarr; ${fn(c)}</div><span class="ta ${cls}">${txt}</span></div>`}
+// ── Session detail modal ──
+async function openSession(sid){
+  if(!sid)return;
+  const mb=$('#modalBg'),m=$('#modal');
+  mb.classList.add('open');
+  m.innerHTML='<button class="modal-close" onclick="closeModal()">×</button><p>Loading session…</p>';
+  try{
+    const r=await fetch(`/api/session/${encodeURIComponent(sid)}${isPrivacy()?'?privacy=1':''}`);
+    const d=await r.json();
+    if(d.error){m.innerHTML=`<button class="modal-close" onclick="closeModal()">×</button><p>${escHtml(d.error)}</p>`;return}
+    renderModal(d);
+  }catch(e){m.innerHTML=`<button class="modal-close" onclick="closeModal()">×</button><p>Error: ${escHtml(e.message)}</p>`}
+}
+function closeModal(){$('#modalBg').classList.remove('open')}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
+
+function renderModal(d){
+  const m=$('#modal');
+  const cb=d.cost_breakdown||{};
+  const cw=(cb.cache_write_5m||0)+(cb.cache_write_1h||0);
+  let h='<button class="modal-close" onclick="closeModal()">×</button>';
+  h+=`<h2>${escHtml(d.label)}</h2>`;
+  h+=`<div class="modal-sub">${escHtml(d.project)} · <span class="cat-pill ${catClass(d.category)}">${escHtml(d.category)}</span> · ${d.messages_user+d.messages_assistant} messages · ${Math.round(d.duration_min)} min · ${fC(d.cost)} total</div>`;
+  if(d.first_prompt){
+    h+=`<div style="background:var(--s2);border-radius:6px;padding:10px 12px;margin-bottom:14px;font-size:12px;color:var(--muted);max-height:120px;overflow-y:auto"><strong style="color:var(--text)">First prompt:</strong> ${escHtml(d.first_prompt.slice(0,500))}${d.first_prompt.length>500?'…':''}</div>`;
+  }
+  if(d.flags&&d.flags.length){
+    h+=`<div style="margin-bottom:14px;font-size:11px"><strong>Flags:</strong> ${d.flags.map(f=>`<span class="cat-pill" style="background:var(--orange-dim);color:var(--orange);margin-right:4px">${escHtml(f)}</span>`).join('')}</div>`;
+  }
+  h+=`<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:14px">`;
+  h+=ms('Cache reads',fC(cb.cache_read||0),'#3b82f6');
+  h+=ms('Cache writes',fC(cw),'#f97316');
+  h+=ms('Output',fC(cb.output||0),'#16a34a');
+  h+=ms('Input',fC(cb.input||0),'#6366f1');
+  h+=`</div>`;
+  if(d.tools&&d.tools.length){
+    h+='<div style="margin-bottom:14px"><div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px">Top tools</div>';
+    for(const t of d.tools.slice(0,8)){h+=`<span class="cat-pill" style="margin-right:4px">${escHtml(t.friendly)} ×${t.count}</span>`}
+    h+='</div>';
+  }
+  if(d.turns&&d.turns.length){
+    h+='<div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px">Turn-by-turn</div>';
+    h+='<div style="max-height:300px;overflow-y:auto"><table class="tt"><thead><tr><th>#</th><th style="text-align:right">Cost</th><th>Driver</th><th>Tool</th><th>Model</th><th style="text-align:right">Output</th><th style="text-align:right">Cache rd</th></tr></thead><tbody>';
+    for(const t of d.turns){
+      h+=`<tr><td>${t.idx}</td><td style="text-align:right;font-weight:600">${fC(t.cost)}</td><td style="font-size:10px;color:var(--muted)">${t.driver}</td><td>${escHtml(t.tool_friendly)}</td><td>${escHtml(t.model_friendly)}</td><td style="text-align:right">${fmt(t.output)}</td><td style="text-align:right">${fmt(t.cache_read)}</td></tr>`;
+    }
+    h+='</tbody></table></div>';
+  }
+  m.innerHTML=h;
+}
 
 init();
 </script>
@@ -1173,34 +2341,71 @@ init();
 </html>"""
 
 
-# ── Server ────────────────────────────────────────────────────────────────────
+# ── Server ───────────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
+    all_sessions = []
+    default_privacy = False
+
     def do_GET(self):
         parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        privacy = (qs.get("privacy", ["0"])[0] == "1") or Handler.default_privacy
+
         if parsed.path == "/api/availability":
-            result = scan_availability()
-            self._json(result)
-        elif parsed.path == "/api/analyze":
-            qs = parse_qs(parsed.query)
+            self._json(scan_availability(Handler.all_sessions))
+            return
+
+        if parsed.path == "/api/analyze":
             df = datetime.strptime(qs.get("from", [_today()])[0], "%Y-%m-%d").date()
             dt = datetime.strptime(qs.get("to", [_today()])[0], "%Y-%m-%d").date()
-            self._json(analyze(df, dt))
-        else:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(DASHBOARD_HTML.encode())
+            data = analyze(Handler.all_sessions, df, dt)
+            if privacy and "error" not in data:
+                data = self._redact(data)
+            self._json(data)
+            return
+
+        if parsed.path.startswith("/api/session/"):
+            sid = parsed.path.rsplit("/", 1)[-1]
+            data = session_detail(Handler.all_sessions, sid)
+            if privacy and "error" not in data:
+                data = self._redact(data)
+            self._json(data)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(DASHBOARD_HTML.encode())
+
+    def _redact(self, data):
+        # Build stable aliases for project paths and session IDs.
+        project_aliases, session_aliases = {}, {}
+        for i, s in enumerate(Handler.all_sessions):
+            if s.get("project_dir") and s["project_dir"] not in project_aliases:
+                project_aliases[s["project_dir"]] = f"project-{chr(65 + len(project_aliases) % 26)}"
+            sid = s.get("session_id")
+            if sid and sid not in session_aliases:
+                session_aliases[sid] = f"session-{_hash_label(sid, 4)}"
+        return redact_obj(data, project_aliases, session_aliases)
 
     def _json(self, data):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self.wfile.write(json.dumps(data, default=_json_default).encode())
 
     def log_message(self, *a):
         pass
+
+
+def _json_default(o):
+    if isinstance(o, (set, tuple)):
+        return list(o)
+    if isinstance(o, datetime):
+        return o.isoformat()
+    raise TypeError(f"Not JSON serializable: {type(o)}")
 
 
 def _today():
@@ -1211,8 +2416,45 @@ def main():
     parser = argparse.ArgumentParser(description="Claude Code Efficiency Analyzer")
     parser.add_argument("--port", type=int, default=8741)
     parser.add_argument("--no-open", action="store_true")
+    parser.add_argument("--export", metavar="OUT.json", help="Write report JSON for the period and exit")
+    parser.add_argument("--days", type=int, default=30, help="Days for --export (default 30)")
+    parser.add_argument("--privacy", action="store_true", help="Default to privacy mode (redact paths/IDs)")
+    parser.add_argument("--demo", action="store_true", help="Use synthetic demo data instead of your local logs (for previews and screenshots)")
     args = parser.parse_args()
 
+    if args.demo:
+        print("Generating demo data (synthetic, no real sessions)...")
+        all_sessions = generate_demo_sessions()
+        print(f"Generated {len(all_sessions)} demo sessions.\n")
+    else:
+        print("Loading session logs...")
+        all_sessions = load_all_sessions()
+        print(f"Loaded {len(all_sessions)} sessions.\n")
+
+    if args.export:
+        avail = scan_availability(all_sessions)
+        if not avail["last_date"]:
+            print("No sessions found.")
+            return
+        last = datetime.fromisoformat(avail["last_date"]).date()
+        first = last - timedelta(days=args.days - 1)
+        report = analyze(all_sessions, first, last)
+        if args.privacy and "error" not in report:
+            project_aliases, session_aliases = {}, {}
+            for s in all_sessions:
+                if s.get("project_dir") and s["project_dir"] not in project_aliases:
+                    project_aliases[s["project_dir"]] = f"project-{chr(65 + len(project_aliases) % 26)}"
+                sid = s.get("session_id")
+                if sid and sid not in session_aliases:
+                    session_aliases[sid] = f"session-{_hash_label(sid, 4)}"
+            report = redact_obj(report, project_aliases, session_aliases)
+        with open(args.export, "w") as f:
+            json.dump(report, f, default=_json_default, indent=2)
+        print(f"Wrote {args.export} ({first} → {last})")
+        return
+
+    Handler.all_sessions = all_sessions
+    Handler.default_privacy = args.privacy
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://localhost:{args.port}"
     print(f"Claude Code Efficiency Analyzer running at {url}")
