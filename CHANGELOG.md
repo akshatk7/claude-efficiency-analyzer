@@ -1,5 +1,102 @@
 # Changelog
 
+## v1.5.0 — 2026-05-02
+
+Generalization pass — the tool was originally built inside one company and
+made too many assumptions about that company's stack. This release widens
+heuristics, adds non-PM demo personas, drops corporate-shaped targets, and
+renames around the new "lean-in" positioning.
+
+### Renamed: Claude Code Mirror
+
+- "Efficiency Analyzer" implied "use less." The tool is for people leaning in
+  on Claude Code — see how you actually use it, then use it more, and use it
+  better. New title: **Claude Code Mirror**
+- Page title, h1, CLI banner, README all updated
+
+### Categorization heuristics generalized
+
+- Old behavior: hardcoded for one stack — Snowflake (data), Granola/Slack
+  (PM), Figma (design), Glean (research). Users with BigQuery/Notion/Linear/
+  Sketch/etc. saw most sessions bucket into "Coding" or "Other"
+- New: pattern-matched against a wide list of mainstream tools — BigQuery,
+  Postgres, MySQL, Redshift, DuckDB, dbt, Looker, Metabase, Notion, Linear,
+  Jira, Asana, ClickUp, Trello, Confluence, Sketch, Framer, Penpot, Miro,
+  Discord, Teams, and more
+- New categories surfaced: **Learning** (tutorials, "how do I", "walk me
+  through"), **Personal Project** (side project / hobby / weekend project),
+  **Communication** (Slack/Discord/Teams)
+
+### Demo personas
+
+- `--demo` now accepts a persona arg with three options
+- `--demo` (no arg) → **solo-dev** persona (new default): Coding-heavy,
+  Debugging, Learning, Personal Project. No enterprise MCP servers
+- `--demo pm` → previous behavior (PM at a tech company)
+- `--demo writer` → writer / researcher persona (heavy writing + research)
+- Default change matters because `--demo` is what new visitors run first;
+  it should reflect the modal Claude Code user
+
+### Dropped hardcoded "5 days/week" active-days target
+
+- Old behavior: Goals panel always showed a fixed 5-day-per-week target.
+  Weekend hobbyists and daily users both got told they were behind
+- Removed entirely. Three remaining targets — cache hit rate, session depth,
+  Opus on trivial work — apply regardless of cadence
+
+### Hero copy reordered: action first, fact second
+
+- Old: hero headline = striking fact (e.g. "Cache costs 3.2× output").
+  Action with $ savings buried below
+- New: hero headline = the top action (what to do). The striking fact moves
+  to the supporting line. Reads as a verdict, not a diagnostic
+
+### Top-10-turns dominance callout
+
+- When ≥5 of the top 10 expensive turns belong to one session, an orange
+  callout above the table says so explicitly with the session label, total
+  cost of those turns, and a `/clear` suggestion. Surfaces the
+  one-session-dominates pattern that the table alone obscures
+
+### Context bloat polish
+
+- Below each spark, axis labels every ~6th turn so you can locate the bloat
+  point without hovering each bar
+- Inline "Suggested `/clear` around turn N" annotation when the curve crosses
+  250K cache reads. Below that: peak cache read + which turn it was on
+
+### Header compression
+
+- Pro/Max banner collapsed to a small "Pro / Max?" chip in the header.
+  Click to expand the full disclaimer; click again to collapse. No more
+  yellow-box-on-first-load
+- Share card button added to the header
+
+### Share card export
+
+- Click "Share card" → downloads a 1200×628 PNG with title, headline, top
+  action, and four key numbers. Sized for LinkedIn / Twitter
+- Drawn client-side via Canvas. Respects the currently-visible date window
+- Includes the API-equivalent disclaimer so screenshot-readers don't think
+  it's the actual bill
+
+### Tier rename — split usage and efficiency
+
+- "Power Use / Heavy Use / Steady Use / Light Use / Just Starting" composite
+  band removed from the hero — it conflated volume with skill, was
+  judgmental for a hobbyist, and duplicated info from the underlying
+  usage_band and efficiency_band
+- Hero now reads `<usage> usage · <efficiency> efficiency` (e.g. "Heavy
+  usage · High efficiency"). The score footer keeps the composite *number*
+  but drops the tier *label*
+
+### `?days=N` API param
+
+- The dashboard JS already passed `?from=X&to=Y` so this never broke for
+  users — but `--export` and curl scripts that tried `?days=30` were
+  silently ignored and got a today-only response
+- API now honors `?days=N` as a fallback when from/to aren't provided
+
 ## v1.4.4 — 2026-05-02
 
 ### Subagent sessions now counted

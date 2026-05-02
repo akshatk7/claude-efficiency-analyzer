@@ -1,6 +1,6 @@
-# Claude Code Efficiency Analyzer
+# Claude Code Mirror
 
-A single-file tool that reads your local Claude Code session logs and helps you understand your spending, token distribution, and where you can be more efficient. No API keys, no dependencies, no data leaves your machine.
+A single-file tool that reads your local Claude Code session logs and shows you how you actually use the tool — spending, token distribution, where context bloats, and one concrete next action. Built for people leaning in on AI, not throttling back. No API keys, no dependencies, no data leaves your machine.
 
 ![Screenshot](screenshot.png)
 
@@ -21,10 +21,12 @@ To stop: `Ctrl+C` in the terminal.
 Want to see what the dashboard looks like before using Claude Code (or before generating enough logs to be interesting)?
 
 ```bash
-python3 analyzer.py --demo
+python3 analyzer.py --demo            # solo-dev persona (default)
+python3 analyzer.py --demo pm         # PM at a tech company (Snowflake/Slack/Granola/Figma)
+python3 analyzer.py --demo writer     # writer / researcher (heavy writing + research, light code)
 ```
 
-This loads ~85 synthetic sessions across 32 days — realistic distributions, deterministic, no real data. The screenshot above was generated this way.
+This loads ~85 synthetic sessions across 32 days — realistic distributions, deterministic, no real data. Three personas so the preview matches the kind of work you'd actually be doing. The screenshot above is the solo-dev default.
 
 ## What You Get
 
@@ -133,17 +135,31 @@ The 1M context window is now standard pricing — no surcharge — for Opus 4.6+
 
 These are API rates. Enterprise plans may have different negotiated rates. Pro and Max plans are flat-fee — cost numbers shown are equivalent API cost, not your actual bill.
 
+## Share card
+
+Click **Share card** in the header to download a 1200×628 PNG with the headline, top action, and four key numbers. Sized for LinkedIn / Twitter. Numbers reflect the currently-visible date window.
+
 ## Options
 
 ```bash
 python3 analyzer.py                    # default port 8741
 python3 analyzer.py --port 9000        # custom port
 python3 analyzer.py --no-open          # don't auto-open browser
-python3 analyzer.py --demo             # synthetic data preview (no real logs)
+python3 analyzer.py --demo             # synthetic data preview (solo-dev default)
+python3 analyzer.py --demo pm          # PM persona
+python3 analyzer.py --demo writer      # writer/researcher persona
 python3 analyzer.py --privacy          # default to privacy mode (redact paths/IDs)
 python3 analyzer.py --export OUT.json  # write report JSON for last 30d and exit
 python3 analyzer.py --export OUT.json --days 7  # custom window
 python3 analyzer.py --export OUT.json --privacy # export with redaction applied
+```
+
+Scripting the API directly:
+
+```bash
+curl http://localhost:8741/api/analyze?days=30           # last 30 days
+curl http://localhost:8741/api/analyze?from=2026-04-01&to=2026-04-30
+curl http://localhost:8741/api/availability               # what date range your logs cover
 ```
 
 ## Requirements

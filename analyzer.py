@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Claude Code Efficiency Analyzer
-Reads your local Claude Code session logs and generates a usage + efficiency report.
+Claude Code Mirror
+Reads your local Claude Code session logs and shows you how you actually use the tool —
+spending, token distribution, where context bloats, and where to focus.
 
 Usage:
   python3 analyzer.py                  # opens browser on port 8741
   python3 analyzer.py --port 9000      # custom port
   python3 analyzer.py --no-open        # don't auto-open browser
   python3 analyzer.py --export OUT.json # write report JSON for the last 30 days and exit
-  python3 analyzer.py --days 30        # period for --export (default 30)
+  python3 analyzer.py --days 30        # period for --export and dashboard window (default 30)
   python3 analyzer.py --privacy        # redact paths/IDs in the dashboard by default
+  python3 analyzer.py --demo           # synthetic preview (solo-dev persona, default)
+  python3 analyzer.py --demo pm        # synthetic preview (PM persona)
+  python3 analyzer.py --demo writer    # synthetic preview (writer/researcher persona)
 """
 
 import argparse
@@ -263,16 +267,50 @@ def _format_project_name(cwd, dirpath):
 
 
 # ── Session label + categorization ───────────────────────────────────────────
+# Heuristics intentionally cover a wide range of stacks: data warehouses
+# (Snowflake/BigQuery/Postgres), PM tools (Notion/Linear/Jira/Asana), design
+# (Figma/Sketch), team comms (Slack/Discord), and personal-context signals
+# (side project, learning, content creation). Extend as new MCP servers ship.
 
 CATEGORY_KEYWORDS = {
-    "Data Analysis": ["sql", "snowflake", "query", "metric", "edw", "table_", "select ", "group by", "data analysis", "pull data"],
-    "PM Work": ["meeting", "digest", "morning sync", "weekly", "prep ", "leadership", "stakeholder", "update doc", "brief", "prd"],
-    "Design Work": ["figma", "design", "prototype", "mockup", "wireframe", "ui ", "ux "],
-    "Debugging": ["debug", "fix ", "broken", "error", "stack trace", "why is", "why does", "investigate"],
-    "Writing": ["write a", "draft", "compose", "rewrite", "edit doc", "blog", "post about"],
-    "Research": ["research", "look into", "what is", "explain how", "compare", "summarize"],
-    "Coding": ["refactor", "implement", "build a", "add a feature", "rename ", "test ", "lint ", "code review"],
+    "Data Analysis": ["sql", "query", "metric", "snowflake", "bigquery", "postgres", "mysql",
+                       "mongodb", "redshift", "duckdb", "dbt", "looker", "tableau", "metabase",
+                       "table_", "select ", "group by", "join ", "data analysis", "pull data",
+                       "jupyter", "notebook", "pandas", "ipynb", "dataframe"],
+    "PM Work": ["meeting", "digest", "morning sync", "weekly", "stand-up", "standup", "prep ",
+                "leadership", "stakeholder", "update doc", "brief", "prd ", "spec doc",
+                "roadmap", "okr", "kpi", "release notes"],
+    "Design Work": ["figma", "sketch", "framer", "penpot", "miro", "whimsical", "excalidraw",
+                     "design", "prototype", "mockup", "wireframe", "ui ", "ux "],
+    "Debugging": ["debug", "fix ", "broken", "error", "stack trace", "why is", "why does",
+                   "investigate", "stacktrace", "exception", "crash"],
+    "Writing": ["write a", "draft", "compose", "rewrite", "edit doc", "blog", "post about",
+                 "newsletter", "essay", "tweet", "linkedin post", "thread", "article"],
+    "Research": ["research", "look into", "what is", "explain how", "compare", "summarize",
+                  "deep dive", "literature", "competitive"],
+    "Learning": ["learn ", "tutorial", "walk me through", "teach me", "how do i", "how do you",
+                  "what's the difference", "what is the difference", "course", "study"],
+    "Personal Project": ["my side project", "side project", "personal site", "portfolio",
+                          "hobby", "weekend project", "for fun", "playing around", "tinker"],
+    "Coding": ["refactor", "implement", "build a", "add a feature", "rename ", "test ",
+                "lint ", "code review", "ship a", "scaffold"],
 }
+
+# MCP server name fragments that map to a category. Lowercased substring match.
+# Add liberally as new servers appear.
+CATEGORY_MCP_PATTERNS = {
+    "Data Analysis": ["snowflake", "bigquery", "postgres", "mysql", "redshift", "duckdb",
+                       "databricks", "dbt", "metabase", "supabase"],
+    "Design Work": ["figma", "sketch", "framer", "penpot", "miro"],
+    "PM Work": ["notion", "linear", "jira", "asana", "clickup", "monday", "trello",
+                 "confluence", "granola", "fireflies", "fathom"],
+    "Communication": ["slack", "discord", "teams", "telegram", "twilio"],
+    "Knowledge": ["glean", "google-workspace", "google_workspace", "office365", "dropbox"],
+}
+
+
+def _count_mcp_matches(tools, fragments):
+    return sum(c for t, c in tools.items() if any(f in t.lower() for f in fragments))
 
 
 def categorize_session(session, first_prompt):
@@ -282,19 +320,18 @@ def categorize_session(session, first_prompt):
     read_n = session["reads"]
     mcp_n = session["mcp_calls"]
 
-    snow_n = sum(c for t, c in tools.items() if "snowflake" in t.lower())
-    granola_n = sum(c for t, c in tools.items() if "granola" in t.lower())
-    slack_n = sum(c for t, c in tools.items() if "slack" in t.lower())
-    gws_n = sum(c for t, c in tools.items() if "google" in t.lower() or "workspace" in t.lower())
-    figma_n = sum(c for t, c in tools.items() if "figma" in t.lower())
-    glean_n = sum(c for t, c in tools.items() if "glean" in t.lower())
+    # Strong MCP-tool-based signals — fire when a specialized server dominates.
+    data_n = _count_mcp_matches(tools, CATEGORY_MCP_PATTERNS["Data Analysis"])
+    design_n = _count_mcp_matches(tools, CATEGORY_MCP_PATTERNS["Design Work"])
+    pm_n = _count_mcp_matches(tools, CATEGORY_MCP_PATTERNS["PM Work"])
+    comm_n = _count_mcp_matches(tools, CATEGORY_MCP_PATTERNS["Communication"])
+    knowledge_n = _count_mcp_matches(tools, CATEGORY_MCP_PATTERNS["Knowledge"])
 
-    # Strong tool-based signals first
-    if snow_n >= 3:
+    if data_n >= 3:
         return "Data Analysis"
-    if figma_n >= 2:
+    if design_n >= 2:
         return "Design Work"
-    if granola_n >= 2 or slack_n >= 5 or gws_n >= 5:
+    if pm_n >= 2 or comm_n >= 5 or knowledge_n >= 5:
         return "PM Work"
     if write_n >= 5 and (read_n / max(write_n, 1)) <= 5 and mcp_n < 5:
         return "Coding"
@@ -305,7 +342,7 @@ def categorize_session(session, first_prompt):
             return cat
 
     # Final shape-based fallbacks
-    if glean_n >= 2 or (read_n >= 5 and write_n == 0):
+    if knowledge_n >= 2 or (read_n >= 5 and write_n == 0):
         return "Research"
     if write_n >= 3:
         return "Coding"
@@ -1021,17 +1058,20 @@ def compute_hero_headline(totals, cost_breakdown, hours, sessions, num_days):
 
 
 def compute_targets(totals, sessions, num_days):
-    """Return progress vs target for a few key metrics."""
+    """Return progress vs target for a few key metrics.
+
+    Targets are usage-pattern guides, not productivity quotas. Consistency-style
+    metrics ("days/week") are intentionally omitted — a weekend hobbyist and a
+    daily user shouldn't both be told they're falling short of a 5-day office
+    benchmark.
+    """
     cache_rate = totals["cache_hit_rate"]
-    active_days = totals["active_days"]
     opus_trivial_pct = totals["opus_trivial_pct"]
     avg_session_depth = totals["total_messages"] / max(totals["sessions"], 1)
 
     return [
         {"name": "Cache hit rate", "value": cache_rate, "target": 0.80, "fmt": "pct",
          "tip": "Higher = more context reused across messages. Long focused sessions help."},
-        {"name": "Active days/week", "value": min(active_days * 7 / max(num_days, 1), 7),
-         "target": 5, "fmt": "days", "tip": "How many days/week you used Claude Code."},
         {"name": "Avg session depth", "value": avg_session_depth, "target": 15, "fmt": "msgs",
          "tip": "Longer sessions amortize context-loading cost. Short sessions reload everything."},
         {"name": "Opus on trivial work", "value": opus_trivial_pct, "target": 0.15, "fmt": "pct_inv",
@@ -1467,86 +1507,203 @@ def session_detail(all_sessions, session_id):
 
 # ── Demo data fixture ───────────────────────────────────────────────────────
 # Synthetic sessions for screenshots, demos, and previewing the tool before
-# you have logs of your own. Deterministic (seeded), no real data.
+# you have logs of your own. Deterministic (seeded), no real data. Three
+# personas so the preview matches the user's reality:
+#   - solo-dev (default): hobbyist or solo developer; mostly code, no
+#     enterprise MCP servers. Modal Claude Code user.
+#   - pm: product manager at a tech company; meetings, data pulls, design
+#     reviews, mixed MCP stack.
+#   - writer: content creator / researcher; lots of writing and research,
+#     light coding.
 
-DEMO_PROJECT_DIRS = {
-    "/demo/projects/demo-app":         "demo-app",
+DEMO_PROJECT_DIRS_SOLO = {
+    "/demo/projects/my-app":           "my-app",
+    "/demo/projects/portfolio-site":   "portfolio-site",
+    "/demo/projects/cli-tool":         "cli-tool",
+    "/demo/projects/learning":         "learning",
+}
+DEMO_PROJECT_DIRS_PM = {
+    "/demo/projects/launch-prep":      "launch-prep",
     "/demo/projects/data-pipeline":    "data-pipeline",
-    "/demo/projects/analytics":        "analytics",
-    "/demo/projects/design-system":    "design-system",
+    "/demo/projects/roadmap":          "roadmap",
+    "/demo/projects/design-review":    "design-review",
+}
+DEMO_PROJECT_DIRS_WRITER = {
+    "/demo/projects/newsletter":       "newsletter",
+    "/demo/projects/research-notes":   "research-notes",
+    "/demo/projects/personal-site":    "personal-site",
 }
 
-DEMO_LABELS = {
-    "Coding": [
-        "Refactor authentication module to support SSO providers",
-        "Add unit tests for the user service edge cases",
-        "Fix the race condition in the queue processing worker",
-        "Implement the new payments webhook handler with retry logic",
-        "Migrate legacy logging to structured logs across services",
-        "Rewrite the rate-limiter to use a sliding window",
-        "Build the admin CLI for tenant onboarding and offboarding",
-    ],
-    "Data Analysis": [
-        "Investigate why DAU dropped on Tuesday — is it real?",
-        "Pull conversion metrics for the Q2 leadership review",
-        "Build the cohort retention query for engagement analysis",
-        "Compare regional performance week over week",
-        "Size the A/B test for the new checkout flow",
-    ],
-    "PM Work": [
-        "Prep for Monday weekly with leadership — agenda and updates",
-        "Digest the planning meeting and update the brief",
-        "Draft the launch email for the new feature",
-        "Investigate the customer support escalation about exports",
-        "Run the morning sync — review yesterday and surface action items",
-    ],
-    "Design Work": [
-        "Review the new onboarding flow in Figma",
-        "Iterate on the dashboard layout for narrow viewports",
-    ],
-    "Debugging": [
-        "Debug why the deploy is failing on staging since this morning",
-        "Investigate the memory leak in the worker process",
-    ],
-    "Research": [
-        "Research how competitors handle multi-tenant data isolation",
-        "Look into the new gRPC streaming patterns for large payloads",
-    ],
-    "Writing": [
-        "Write the design doc for cache invalidation across services",
-        "Draft the post-mortem for last week's incident",
-    ],
+DEMO_PERSONAS = {
+    "solo-dev": {
+        "project_dirs": DEMO_PROJECT_DIRS_SOLO,
+        "categories": ["Coding", "Debugging", "Learning", "Research", "Personal Project", "Writing"],
+        "weights": [50, 18, 14, 8, 6, 4],
+        "labels": {
+            "Coding": [
+                "Refactor the auth module to support OAuth providers",
+                "Add unit tests for the user service edge cases",
+                "Fix the race condition in the worker queue",
+                "Wire up the Stripe webhook handler with retry logic",
+                "Migrate the logger to structured JSON logs",
+                "Rewrite the rate-limiter as a sliding window",
+                "Add pagination to the products endpoint",
+                "Set up GitHub Actions CI for the test suite",
+            ],
+            "Debugging": [
+                "Debug why my Postgres query is hanging in production",
+                "Investigate the memory leak in the worker process",
+                "Track down why the deploy keeps failing on the build step",
+                "Why does my React component re-render 12 times on mount?",
+            ],
+            "Learning": [
+                "Walk me through how React Server Components actually work",
+                "Teach me what fiber is in the JS event loop",
+                "What's the difference between SSE and WebSocket?",
+                "How do I structure a Next.js app with Server Actions?",
+                "Explain how Postgres MVCC works with examples",
+            ],
+            "Research": [
+                "Research the best embedding models for code search in 2026",
+                "Compare Vercel vs Cloudflare vs Fly.io for a Node app",
+                "Look into how Linear handles real-time sync under the hood",
+            ],
+            "Personal Project": [
+                "Build the landing page for my side project",
+                "Add a Stripe checkout flow to my hobby site",
+                "Set up the database schema for my note-taking app",
+                "Wire up auth on my weekend project",
+            ],
+            "Writing": [
+                "Draft the README for my open source library",
+                "Write the launch post for my side project",
+            ],
+        },
+        "tool_profiles": {
+            "Coding":           {"Edit": (5, 25), "Write": (1, 6), "Read": (8, 30), "Bash": (3, 12), "Grep": (1, 8), "Glob": (1, 4)},
+            "Debugging":        {"Read": (10, 30), "Bash": (5, 18), "Grep": (3, 10), "Edit": (1, 6)},
+            "Learning":         {"Read": (2, 8), "WebSearch": (1, 4), "WebFetch": (0, 3)},
+            "Research":         {"WebSearch": (2, 6), "WebFetch": (1, 4), "Read": (1, 5)},
+            "Personal Project": {"Edit": (3, 14), "Write": (1, 4), "Read": (4, 15), "Bash": (2, 8), "Grep": (1, 5)},
+            "Writing":          {"Read": (3, 10), "Edit": (1, 4), "Write": (0, 2)},
+        },
+    },
+    "pm": {
+        "project_dirs": DEMO_PROJECT_DIRS_PM,
+        "categories": ["Coding", "Data Analysis", "PM Work", "Design Work", "Debugging", "Research", "Writing"],
+        "weights": [25, 22, 22, 8, 8, 8, 7],
+        "labels": {
+            "Coding": [
+                "Prototype the new admin CLI for tenant onboarding",
+                "Build a quick script to dedupe the customer export",
+            ],
+            "Data Analysis": [
+                "Investigate why DAU dropped on Tuesday — is it real?",
+                "Pull conversion metrics for the Q2 leadership review",
+                "Build the cohort retention query for engagement analysis",
+                "Compare regional performance week over week",
+                "Size the A/B test for the new checkout flow",
+            ],
+            "PM Work": [
+                "Prep for the leadership weekly — agenda and updates",
+                "Digest the planning meeting and update the brief",
+                "Draft the launch email for the new feature",
+                "Investigate the customer escalation about exports",
+                "Run the morning sync — review yesterday and surface action items",
+            ],
+            "Design Work": [
+                "Review the new onboarding flow in Figma",
+                "Iterate on the dashboard layout for narrow viewports",
+            ],
+            "Debugging": [
+                "Debug why the staging deploy keeps failing this morning",
+                "Investigate the memory leak in the worker process",
+            ],
+            "Research": [
+                "Research how competitors handle multi-tenant data isolation",
+                "Look into emerging gRPC streaming patterns",
+            ],
+            "Writing": [
+                "Draft the design doc for cache invalidation across services",
+                "Write the post-mortem for last week's incident",
+            ],
+        },
+        "tool_profiles": {
+            "Coding":        {"Edit": (5, 25), "Write": (1, 6), "Read": (8, 30), "Bash": (3, 12), "Grep": (1, 8), "Glob": (1, 4)},
+            "Data Analysis": {"mcp__snowflake__run_snowflake_query": (3, 12), "mcp__snowflake__list_objects": (1, 4), "Read": (2, 8), "Edit": (0, 3)},
+            "PM Work":       {"mcp__granola__get_meeting_transcript": (1, 4), "mcp__slack__slack_read_thread": (2, 7), "mcp__google-workspace__editGoogleDoc": (1, 4), "mcp__google-workspace__readGoogleDoc": (1, 5), "Read": (1, 5)},
+            "Design Work":   {"mcp__figma__get_design_context": (1, 4), "mcp__figma__get_screenshot": (0, 3), "Read": (1, 5)},
+            "Debugging":     {"Read": (10, 30), "Bash": (5, 18), "Grep": (3, 10), "Edit": (1, 6)},
+            "Research":      {"mcp__glean_default__search": (2, 8), "mcp__glean_default__read_document": (1, 5), "WebSearch": (1, 4), "Read": (3, 10)},
+            "Writing":       {"mcp__google-workspace__editGoogleDoc": (1, 4), "Read": (3, 12), "Edit": (1, 4), "Write": (0, 2)},
+        },
+    },
+    "writer": {
+        "project_dirs": DEMO_PROJECT_DIRS_WRITER,
+        "categories": ["Writing", "Research", "Learning", "Coding", "Personal Project"],
+        "weights": [42, 28, 14, 10, 6],
+        "labels": {
+            "Writing": [
+                "Draft this week's newsletter on AI infra economics",
+                "Rewrite the intro to my long-form essay on agentic search",
+                "Polish the outline for next month's deep-dive piece",
+                "Draft a Twitter thread summarizing the new paper",
+                "Write the LinkedIn post about my latest experiment",
+            ],
+            "Research": [
+                "Compare claims across the three major LLM scaling papers",
+                "Research how Cloudflare Workers handle WebSocket fanout",
+                "Pull together a primer on prompt-caching pricing models",
+            ],
+            "Learning": [
+                "Teach me how attention sinks actually work in long context",
+                "What's the trade-off between RAG and long context for my use case?",
+                "Walk me through MCP server architecture",
+            ],
+            "Coding": [
+                "Set up a small static site for my newsletter archive",
+                "Write a script to scrape my Substack analytics",
+            ],
+            "Personal Project": [
+                "Build the visualization for my next post",
+                "Wire up an RSS feed for my personal site",
+            ],
+        },
+        "tool_profiles": {
+            "Writing":          {"Edit": (3, 12), "Write": (1, 5), "Read": (3, 10), "WebFetch": (0, 3)},
+            "Research":         {"WebSearch": (3, 10), "WebFetch": (2, 8), "Read": (2, 6)},
+            "Learning":         {"WebSearch": (1, 4), "Read": (2, 6)},
+            "Coding":           {"Edit": (3, 14), "Write": (1, 4), "Read": (4, 15), "Bash": (2, 8)},
+            "Personal Project": {"Edit": (2, 10), "Write": (1, 4), "Read": (3, 12), "Bash": (1, 5)},
+        },
+    },
 }
 
-DEMO_TOOL_PROFILES = {
-    "Coding":        {"Edit": (5, 25), "Write": (1, 6), "Read": (8, 30), "Bash": (3, 12), "Grep": (1, 8), "Glob": (1, 4)},
-    "Data Analysis": {"mcp__snowflake__run_snowflake_query": (3, 12), "mcp__snowflake__list_objects": (1, 4), "Read": (2, 8), "Edit": (0, 3)},
-    "PM Work":       {"mcp__granola__get_meeting_transcript": (1, 4), "mcp__slack__slack_read_thread": (2, 7), "mcp__google-workspace__editGoogleDoc": (1, 4), "mcp__google-workspace__readGoogleDoc": (1, 5), "Read": (1, 5)},
-    "Design Work":   {"mcp__figma__get_design_context": (1, 4), "mcp__figma__get_screenshot": (0, 3), "Read": (1, 5)},
-    "Debugging":     {"Read": (10, 30), "Bash": (5, 18), "Grep": (3, 10), "Edit": (1, 6)},
-    "Research":      {"mcp__glean_default__search": (2, 8), "mcp__glean_default__read_document": (1, 5), "WebSearch": (1, 4), "Read": (3, 10)},
-    "Writing":       {"mcp__google-workspace__editGoogleDoc": (1, 4), "Read": (3, 12), "Edit": (1, 4), "Write": (0, 2)},
-}
 
-
-def generate_demo_sessions(n_sessions=85, end_date=None, seed=42):
+def generate_demo_sessions(n_sessions=85, end_date=None, seed=42, persona="solo-dev"):
     """Build deterministic synthetic session records that match the parser shape."""
     rng = random.Random(seed)
     if end_date is None:
         end_date = datetime.now(timezone.utc).date()
 
+    if persona not in DEMO_PERSONAS:
+        raise ValueError(f"Unknown demo persona '{persona}'. Choose from: {', '.join(DEMO_PERSONAS)}")
+    profile = DEMO_PERSONAS[persona]
+
     # Pre-populate project name cache so render uses friendly demo names.
-    for path, name in DEMO_PROJECT_DIRS.items():
+    for path, name in profile["project_dirs"].items():
         _project_name_cache[path] = name
 
-    project_paths = list(DEMO_PROJECT_DIRS.keys())
-    categories = list(DEMO_LABELS.keys())
-    cat_weights = [38, 22, 18, 5, 8, 5, 4]  # Coding-heavy, then Data/PM
+    project_paths = list(profile["project_dirs"].keys())
+    categories = profile["categories"]
+    cat_weights = profile["weights"]
+    persona_labels = profile["labels"]
+    persona_tool_profiles = profile["tool_profiles"]
 
     sessions = []
     for i in range(n_sessions):
         category = rng.choices(categories, weights=cat_weights)[0]
-        label = rng.choice(DEMO_LABELS[category])
+        label = rng.choice(persona_labels[category])
 
         # Date — concentrated in the last 14 days, tail back to 32.
         days_back = int(min(31, max(0, abs(rng.gauss(8, 8)))))
@@ -1580,8 +1737,8 @@ def generate_demo_sessions(n_sessions=85, end_date=None, seed=42):
 
         # Tool calls per category
         tool_calls = defaultdict(int)
-        profile = DEMO_TOOL_PROFILES.get(category, {})
-        for tool, (lo, hi) in profile.items():
+        cat_tool_profile = persona_tool_profiles.get(category, {})
+        for tool, (lo, hi) in cat_tool_profile.items():
             if hi > 0:
                 tool_calls[tool] = rng.randint(lo, hi)
 
@@ -1716,7 +1873,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Code Efficiency Analyzer</title>
+<title>Claude Code Mirror</title>
 <style>
 :root{--bg:#f5f6f8;--s1:#fff;--s2:#f0f1f4;--s3:#e5e7ee;--border:#dde0e8;--text:#1a1d2b;--muted:#6b7085;--dim:#9298b0;--accent:#6366f1;--green:#16a34a;--green-dim:rgba(22,163,74,.08);--yellow:#ca8a04;--yellow-dim:rgba(202,138,4,.08);--orange:#ea580c;--orange-dim:rgba(234,88,12,.08);--red:#dc2626;--blue:#2563eb;--blue-dim:rgba(37,99,235,.07);--purple:#a855f7}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1735,8 +1892,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 .banner h4{font-size:13px;font-weight:700;color:#9a3412;margin-bottom:3px}
 .banner p{color:#7c2d12}
 .banner button{background:transparent;border:none;color:#9a3412;font-size:18px;cursor:pointer;line-height:1;font-family:inherit;padding:0 4px}
-.avail{background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:14px 18px;margin:14px 0;font-size:13px;color:var(--muted)}.avail strong{color:var(--text)}
-.controls{display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap}
+.banner-chip{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;padding:5px 10px;border-radius:6px;cursor:pointer;font-family:inherit}
+.banner-chip:hover{background:#ffedd5}
+.avail{background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin:10px 0 6px;font-size:12px;color:var(--muted)}.avail strong{color:var(--text)}
+.controls{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}
 .dw input[type="date"]{background:var(--s1);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;font-family:inherit;cursor:pointer;min-width:150px}
 .dw input:focus{outline:none;border-color:var(--accent)}
 button{padding:8px 20px;border-radius:6px;font-size:13px;cursor:pointer;border:none;font-family:inherit;font-weight:600;transition:all .15s}
@@ -1859,8 +2018,10 @@ button{padding:8px 20px;border-radius:6px;font-size:13px;cursor:pointer;border:n
 <body>
 <div class="wrap">
   <div class="header"><div class="header-row">
-    <div><h1>Claude Code Efficiency Analyzer</h1><p>Reads your local Claude Code session logs. No data leaves your machine.</p></div>
+    <div><h1>Claude Code Mirror</h1><p>How you actually use Claude Code. Local-only, no data leaves your machine.</p></div>
     <div class="header-actions">
+      <button id="bannerChip" class="banner-chip hidden" onclick="toggleBannerExpand()" title="API-equivalent cost — what about Pro/Max?">Pro / Max?</button>
+      <button class="btn-print" onclick="downloadShareCard()" title="Download a 1200×628 share card image">Share card</button>
       <label class="toggle" id="privacyToggle"><input type="checkbox" id="privacy"> Privacy mode</label>
       <button class="btn-print" onclick="window.print()">Print / PDF</button>
     </div>
@@ -1922,10 +2083,18 @@ async function run(){
 }
 
 function maybeShowBanner(d){
-  if(localStorage.getItem(BANNER_KEY)==='1'){return}
-  const b=$('#banner');b.classList.remove('hidden');
-  b.className='banner';
-  b.innerHTML=`<div><h4>On Claude Pro or Max?</h4><p>The dollar amounts below are <strong>API-equivalent</strong> — what your usage would cost at API rates. Pro ($20/mo) and Max ($100-200/mo) are flat-fee, so this is <em>not</em> your actual bill. Useful for comparing across periods or spotting expensive patterns, not for predicting your invoice.</p></div><button onclick="dismissBanner()" title="Dismiss">×</button>`;
+  // Default state: a small "Pro / Max?" chip in the header. Clicking it
+  // expands the full explainer. Once the user dismisses the expanded version,
+  // the chip stays so they can re-open it later — no permanent dismissal.
+  const chip=$('#bannerChip');if(chip)chip.classList.remove('hidden');
+}
+function toggleBannerExpand(){
+  const b=$('#banner');
+  if(b.classList.contains('hidden')){
+    b.classList.remove('hidden');
+    b.className='banner';
+    b.innerHTML=`<div><h4>On Claude Pro or Max?</h4><p>The dollar amounts below are <strong>API-equivalent</strong> — what your usage would cost at API rates. Pro ($20/mo) and Max ($100-200/mo) are flat-fee, so this is <em>not</em> your actual bill. Useful for comparing across periods or spotting expensive patterns, not for predicting your invoice.</p></div><button onclick="toggleBannerExpand()" title="Collapse">×</button>`;
+  }else{b.classList.add('hidden')}
 }
 function dismissBanner(){localStorage.setItem(BANNER_KEY,'1');$('#banner').classList.add('hidden')}
 
@@ -1940,20 +2109,22 @@ function escHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<'
 function rR(arr,kind){if(!arr||!arr.length)return'';return arr.map(r=>`<div class="rec rec-${kind}"><h4>${escHtml(r.title)}${r.savings?`<span class="savings">~${fC(r.savings)}</span>`:''}</h4><p>${r.body}</p></div>`).join('')}
 
 // ── Hero ──
+// Action-first: lead with what to do, then the supporting fact, then numbers.
 function renderHero(d){
   const s=d.summary,e=d.efficiency,sc_=d.scores,tf=d.top_finding;
-  let action=tf?`<strong>${escHtml(tf.headline)}.</strong> ${escHtml(tf.action)}`:'No clear single action — your usage looks balanced. See targets and recommendations below for incremental tuning.';
-  const headline=d.hero_headline||`${fC(s.total_cost)} across ${s.sessions} sessions.`;
+  const fact=d.hero_headline||`${fC(s.total_cost)} across ${s.sessions} sessions.`;
+  const headline=tf?`${escHtml(tf.headline)}.`:'Your usage looks balanced — no single action stands out.';
+  const sub=tf?`<strong>Do this:</strong> ${escHtml(tf.action)} <span style="color:var(--dim)">·</span> <span style="color:var(--muted)">${escHtml(fact)}</span>`:`<span style="color:var(--muted)">${escHtml(fact)}</span>`;
   let h=`<div class="hero">
-    <div class="hero-headline">${escHtml(headline)}</div>
-    <div class="hero-action">${action}</div>
+    <div class="hero-headline">${headline}</div>
+    <div class="hero-action">${sub}</div>
     <div class="hero-stats">
       <div class="hero-stat"><div class="v">${fC(s.total_cost)}</div><div class="l">Period spend</div><div class="s">~${fC(e.projected_monthly)}/mo · ${fC(e.projected_yearly)}/yr</div></div>
       <div class="hero-stat"><div class="v">${s.total_hours}h</div><div class="l">Active hours</div><div class="s">${s.sessions} sessions · ${s.total_user_msgs+s.total_asst_msgs} messages</div></div>
       <div class="hero-stat"><div class="v">${pctR(e.cache_hit_rate)}</div><div class="l">Cache reuse</div><div class="s">${fmt(s.total_tokens)} tokens processed</div></div>
       <div class="hero-stat"><div class="v">${d.period.active_days} of ${d.period.days}</div><div class="l">Days active</div><div class="s">${(s.total_user_msgs+s.total_asst_msgs)/Math.max(d.period.active_days,1)|0} msgs/active day</div></div>
     </div>
-    <div class="hero-profile"><strong>${sc_.composite_band}</strong> · ${sc_.usage_band.toLowerCase()} usage · ${sc_.efficiency_band.toLowerCase()} efficiency</div>
+    <div class="hero-profile"><strong>${escHtml(sc_.usage_band)}</strong> usage · <strong>${escHtml(sc_.efficiency_band)}</strong> efficiency</div>
   </div>`;
   return h;
 }
@@ -2147,6 +2318,26 @@ function renderTopTurns(turns){
     h+=`<p style="font-size:12px;color:var(--muted)">No turns matched this filter.</p></div>`;
     return h;
   }
+  // Dominance callout — when one session owns ≥5 of the top 10, that's the
+  // story, not the table. Surface it explicitly.
+  if(!CATEGORY_FILTER && filtered.length>=5){
+    const counts={},costs={},labels={},sids={};
+    for(const t of filtered.slice(0,10)){
+      const k=t.session_id||t.session_label;
+      counts[k]=(counts[k]||0)+1;
+      costs[k]=(costs[k]||0)+t.cost;
+      labels[k]=t.session_label;
+      sids[k]=t.session_id;
+    }
+    let topK=null,topN=0;
+    for(const k in counts){if(counts[k]>topN){topN=counts[k];topK=k}}
+    if(topN>=5){
+      const lbl=labels[topK]||'one session';
+      const sid=sids[topK];
+      const link=sid?`<a class="session-link" onclick="openSession('${sid}')">${escHtml(lbl)}</a>`:escHtml(lbl);
+      h+=`<div style="background:var(--orange-dim);border-left:3px solid var(--orange);padding:10px 14px;border-radius:6px;font-size:12px;margin-bottom:14px;line-height:1.5"><strong>${topN} of your top 10 expensive turns came from one session</strong> (${link}, ${fC(costs[topK])} of these turns alone). Long sessions like this benefit most from <code>/clear</code> checkpoints when context is no longer load-bearing.</div>`;
+    }
+  }
   h+='<div style="overflow-x:auto"><table class="tt"><thead><tr><th>#</th><th>Cost</th><th>Driver</th><th>Tool</th><th>Model</th><th>Session</th><th>When</th></tr></thead><tbody>';
   filtered.forEach((t,i)=>{
     const when=t.ts?t.ts.slice(0,16).replace('T',' '):'';
@@ -2166,16 +2357,31 @@ function filterTurnsByCategory(cat){
 function clearTurnFilter(){CATEGORY_FILTER=null;if(LAST_DATA)render(LAST_DATA)}
 
 // ── Bloat ──
+// Sparkline + an inline /clear suggestion when the curve crossed 250K cache
+// reads. Below the spark we label every ~6th turn so readers can locate the
+// bloat point without hovering 30 bars.
 function renderBloat(curves){
   if(!curves||!curves.length)return'';
   let h='<div class="panel" style="margin-bottom:20px"><h3>Context bloat — top 3 sessions</h3><p class="panel-sub">Cache reads per turn over the life of each session. A rising staircase = stale context piling up.</p>';
   for(const c of curves){
     const mx=Math.max(...c.points.map(p=>p.cr),1);
-    h+=`<div style="margin-bottom:14px"><div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;gap:10px"><div style="font-size:12px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a class="session-link" onclick="openSession('${c.session_id}')">${escHtml(c.label)}</a></div><div style="font-size:11px;color:var(--muted);flex-shrink:0">${c.messages} msgs · avg ${fmt(c.avg_cache_read)} cache · ${fC(c.cost)}</div></div><div class="spark">`;
+    // First turn where cache read crossed 250K — a reasonable /clear hint
+    const THRESH=250000;
+    let crossIdx=null;
+    for(const p of c.points){if(p.cr>=THRESH){crossIdx=p.idx;break}}
+    const crossNote=crossIdx?`<span style="color:var(--orange);font-weight:600">Suggested <code>/clear</code> around turn ${crossIdx}</span> · `:'';
+    h+=`<div style="margin-bottom:18px"><div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;gap:10px"><div style="font-size:12px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a class="session-link" onclick="openSession('${c.session_id}')">${escHtml(c.label)}</a></div><div style="font-size:11px;color:var(--muted);flex-shrink:0">${c.messages} msgs · avg ${fmt(c.avg_cache_read)} cache · ${fC(c.cost)}</div></div><div class="spark">`;
     for(const p of c.points){const hp=Math.max((p.cr/mx)*100,1);h+=`<div class="b" style="height:${hp}%" title="turn ${p.idx}: ${fmt(p.cr)} cache read"></div>`}
-    h+='</div></div>';
+    h+='</div>';
+    // Axis labels every ~6th turn (max 6 labels across the row)
+    const n=c.points.length;
+    const step=Math.max(1,Math.floor(n/6));
+    let labels='';
+    for(let i=0;i<n;i+=step){labels+=`<span style="flex:${step}">t${c.points[i].idx}</span>`}
+    h+=`<div style="display:flex;font-size:9px;color:var(--dim);margin-top:2px;letter-spacing:.3px">${labels}</div>`;
+    h+=`<div style="font-size:10px;color:var(--muted);margin-top:4px">${crossNote}peak ${fmt(mx)} cache read on turn ${c.points.find(p=>p.cr===mx)?.idx||'?'}</div></div>`;
   }
-  return h+'<p style="font-size:11px;color:var(--dim);margin-top:6px">When the bars stop dropping back down between turns, the conversation has accumulated context that\'s no longer load-bearing. <code>/clear</code> resets it.</p></div>';
+  return h+'<p style="font-size:11px;color:var(--dim);margin-top:6px">When bars stop dropping back down between turns, the conversation has accumulated context that\'s no longer load-bearing. <code>/clear</code> resets it.</p></div>';
 }
 
 // ── Daily ──
@@ -2234,8 +2440,8 @@ function renderScore(sc_,e){
   return `<div style="display:flex;justify-content:center;margin-bottom:8px">
     <div class="score-tile" style="border-color:${sc(sc_.composite)};max-width:340px;width:100%">
       <div class="num" style="color:${sc(sc_.composite)}">${sc_.composite}</div>
-      <div class="lbl">Overall · ${sc_.composite_band}</div>
-      <div class="desc">Usage ${sc_.usage} (${sc_.usage_band.toLowerCase()}) · Efficiency ${sc_.efficiency} (${sc_.efficiency_band.toLowerCase()})</div>
+      <div class="lbl">Overall</div>
+      <div class="desc">Usage ${sc_.usage} (${escHtml(sc_.usage_band.toLowerCase())}) · Efficiency ${sc_.efficiency} (${escHtml(sc_.efficiency_band.toLowerCase())})</div>
     </div>
   </div>
   <p style="font-size:10px;color:var(--dim);text-align:center;margin-bottom:20px">Composite of usage and efficiency, weighted to penalize being very high in one and very low in the other.</p>`;
@@ -2345,6 +2551,77 @@ function renderModal(d){
   m.innerHTML=h;
 }
 
+// ── Share card (1200×628 PNG, drawn client-side via Canvas) ──
+// Made for LinkedIn/Twitter share images. Uses cached LAST_DATA so it
+// reflects the currently-visible window. Respects privacy mode by drawing
+// only aggregate numbers — no session labels or paths.
+function downloadShareCard(){
+  if(!LAST_DATA){alert('Analyze a window first, then click Share card.');return}
+  const d=LAST_DATA,s=d.summary,e=d.efficiency,sc_=d.scores,tf=d.top_finding;
+  const W=1200,H=628;
+  const c=document.createElement('canvas');c.width=W;c.height=H;
+  const x=c.getContext('2d');
+  // Background gradient (matches hero)
+  const g=x.createLinearGradient(0,0,W,H);g.addColorStop(0,'#eef2ff');g.addColorStop(1,'#f5f3ff');
+  x.fillStyle=g;x.fillRect(0,0,W,H);
+  // Subtle grid border
+  x.strokeStyle='#c7d2fe';x.lineWidth=2;x.strokeRect(1,1,W-2,H-2);
+  // Title bar
+  x.fillStyle='#1a1d2b';x.font='600 22px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+  x.fillText('Claude Code Mirror',56,68);
+  x.fillStyle='#6b7085';x.font='400 14px -apple-system,sans-serif';
+  x.fillText('How you actually use Claude Code · github.com/akshatk7/claude-efficiency-analyzer',56,92);
+  // Headline (top finding or fallback hero headline)
+  const headline=tf?tf.headline:(d.hero_headline||`${s.sessions} sessions over ${d.period.active_days} active days`);
+  x.fillStyle='#1a1d2b';x.font='700 38px -apple-system,sans-serif';
+  wrapText(x,headline,56,170,W-112,46);
+  // Action sub-line
+  if(tf){
+    x.fillStyle='#3730a3';x.font='500 18px -apple-system,sans-serif';
+    wrapText(x,'→ '+tf.action,56,290,W-112,26);
+  }
+  // 4 stat tiles
+  const tiles=[
+    {v:fmtMoney(s.total_cost),l:'PERIOD SPEND',s:'~'+fmtMoney(e.projected_monthly)+'/mo'},
+    {v:s.total_hours+'h',l:'ACTIVE HOURS',s:s.sessions+' sessions'},
+    {v:Math.round(e.cache_hit_rate*100)+'%',l:'CACHE REUSE',s:fmtNum(s.total_tokens)+' tokens'},
+    {v:d.period.active_days+'/'+d.period.days,l:'DAYS ACTIVE',s:''},
+  ];
+  const tileW=(W-112-3*16)/4,tileH=130,tileY=420;
+  tiles.forEach((t,i)=>{
+    const tx=56+i*(tileW+16);
+    x.fillStyle='#fff';x.strokeStyle='#c7d2fe';x.lineWidth=1;
+    roundRect(x,tx,tileY,tileW,tileH,12);x.fill();x.stroke();
+    x.fillStyle='#1a1d2b';x.font='800 32px -apple-system,sans-serif';
+    x.fillText(t.v,tx+18,tileY+50);
+    x.fillStyle='#6b7085';x.font='600 11px -apple-system,sans-serif';
+    x.fillText(t.l,tx+18,tileY+78);
+    x.fillStyle='#9298b0';x.font='400 12px -apple-system,sans-serif';
+    x.fillText(t.s,tx+18,tileY+100);
+  });
+  // Footer disclaimer
+  x.fillStyle='#9298b0';x.font='400 11px -apple-system,sans-serif';
+  x.fillText('Numbers are API-equivalent cost. Pro/Max plans are flat-fee. Generated locally — no data uploaded.',56,H-30);
+  // Download
+  c.toBlob(blob=>{
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download='claude-code-mirror.png';a.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  },'image/png');
+}
+function wrapText(ctx,text,x,y,maxW,lineH){
+  const words=String(text).split(/\s+/);let line='',ly=y;
+  for(const w of words){
+    const test=line?line+' '+w:w;
+    if(ctx.measureText(test).width>maxW&&line){ctx.fillText(line,x,ly);line=w;ly+=lineH}
+    else{line=test}
+  }
+  if(line)ctx.fillText(line,x,ly);
+}
+function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath()}
+function fmtMoney(n){return n>=1?'$'+n.toFixed(0):'$'+n.toFixed(2)}
+function fmtNum(n){return n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n))}
+
 init();
 </script>
 </body>
@@ -2367,8 +2644,19 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/analyze":
-            df = datetime.strptime(qs.get("from", [_today()])[0], "%Y-%m-%d").date()
-            dt = datetime.strptime(qs.get("to", [_today()])[0], "%Y-%m-%d").date()
+            # Accept ?from=YYYY-MM-DD&to=YYYY-MM-DD (preferred, what the dashboard uses)
+            # OR ?days=N (convenience for curl/scripts — uses last N days from latest log).
+            if "from" in qs and "to" in qs:
+                df = datetime.strptime(qs["from"][0], "%Y-%m-%d").date()
+                dt = datetime.strptime(qs["to"][0], "%Y-%m-%d").date()
+            else:
+                days = int(qs.get("days", ["30"])[0])
+                avail = scan_availability(Handler.all_sessions)
+                if avail["last_date"]:
+                    dt = datetime.fromisoformat(avail["last_date"]).date()
+                    df = dt - timedelta(days=days - 1)
+                else:
+                    df = dt = datetime.fromisoformat(_today()).date()
             data = analyze(Handler.all_sessions, df, dt)
             if privacy and "error" not in data:
                 data = self._redact(data)
@@ -2423,18 +2711,24 @@ def _today():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Claude Code Efficiency Analyzer")
+    parser = argparse.ArgumentParser(description="Claude Code Mirror — how you actually use Claude Code")
     parser.add_argument("--port", type=int, default=8741)
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--export", metavar="OUT.json", help="Write report JSON for the period and exit")
     parser.add_argument("--days", type=int, default=30, help="Days for --export (default 30)")
     parser.add_argument("--privacy", action="store_true", help="Default to privacy mode (redact paths/IDs)")
-    parser.add_argument("--demo", action="store_true", help="Use synthetic demo data instead of your local logs (for previews and screenshots)")
+    parser.add_argument("--demo", nargs='?', const='solo-dev', default=None,
+                        metavar="PERSONA",
+                        help="Use synthetic demo data instead of your local logs. "
+                             "Persona: solo-dev (default), pm, writer.")
     args = parser.parse_args()
 
-    if args.demo:
-        print("Generating demo data (synthetic, no real sessions)...")
-        all_sessions = generate_demo_sessions()
+    if args.demo is not None:
+        if args.demo not in DEMO_PERSONAS:
+            print(f"Unknown demo persona '{args.demo}'. Choose: {', '.join(DEMO_PERSONAS)}")
+            return
+        print(f"Generating demo data (persona='{args.demo}', synthetic, no real sessions)...")
+        all_sessions = generate_demo_sessions(persona=args.demo)
         print(f"Generated {len(all_sessions)} demo sessions.\n")
     else:
         print("Loading session logs...")
@@ -2467,7 +2761,7 @@ def main():
     Handler.default_privacy = args.privacy
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://localhost:{args.port}"
-    print(f"Claude Code Efficiency Analyzer running at {url}")
+    print(f"Claude Code Mirror running at {url}")
     print("Press Ctrl+C to stop.\n")
     if not args.no_open:
         webbrowser.open(url)
