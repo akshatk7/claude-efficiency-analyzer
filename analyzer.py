@@ -10,7 +10,6 @@ Usage:
   python3 analyzer.py --no-open        # don't auto-open browser
   python3 analyzer.py --export OUT.json # write report JSON for the last 30 days and exit
   python3 analyzer.py --days 30        # period for --export and dashboard window (default 30)
-  python3 analyzer.py --privacy        # redact paths/IDs in the dashboard by default
   python3 analyzer.py --demo           # synthetic preview (solo-dev persona, default)
   python3 analyzer.py --demo pm        # synthetic preview (PM persona)
   python3 analyzer.py --demo writer    # synthetic preview (writer/researcher persona)
@@ -18,7 +17,6 @@ Usage:
 
 import argparse
 import glob
-import hashlib
 import json
 import os
 import random
@@ -714,43 +712,6 @@ def slice_sessions(all_sessions, date_from, date_to):
             continue
         out.append((s, dict(in_range_dates)))
     return out
-
-
-# ── Privacy redaction ────────────────────────────────────────────────────────
-
-def _hash_label(s, n=6):
-    return hashlib.sha256((s or "").encode()).hexdigest()[:n]
-
-
-def redact_obj(obj, project_aliases, session_aliases):
-    """Walk the report and replace identifiers with stable aliases."""
-    home = os.path.expanduser("~")
-    user = os.environ.get("USER", "user")
-
-    def rstr(s):
-        if not isinstance(s, str):
-            return s
-        s = s.replace(home, "~").replace("/Users/" + user, "~")
-        s = re.sub(r"/Users/[^/\s]+", "~", s)
-        # Replace UUIDs with aliases when known.
-        for sid, alias in session_aliases.items():
-            if sid and sid in s:
-                s = s.replace(sid, alias)
-        for path, alias in project_aliases.items():
-            if path and path in s:
-                s = s.replace(path, alias)
-        # Names aren't fully scrubbed (free text could contain anything) — that's by design.
-        return s
-
-    def walk(x):
-        if isinstance(x, dict):
-            return {k: walk(v) for k, v in x.items()}
-        if isinstance(x, list):
-            return [walk(v) for v in x]
-        if isinstance(x, str):
-            return rstr(x)
-        return x
-    return walk(obj)
 
 
 # ── Scoring ──────────────────────────────────────────────────────────────────
@@ -1882,12 +1843,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 .header{margin-bottom:14px}.header h1{font-size:22px;font-weight:700;margin-bottom:2px}.header p{font-size:13px;color:var(--muted)}
 .header-row{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
 .header-actions{display:flex;gap:8px;align-items:center}
-.toggle{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);cursor:pointer;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--s1)}
-.toggle input{margin:0}
-.toggle:hover{background:var(--s2)}
-.toggle.on{background:var(--blue-dim);border-color:var(--blue);color:var(--blue)}
-.btn-print{padding:6px 12px;border:1px solid var(--border);background:var(--s1);color:var(--muted);font-size:11px;border-radius:6px;cursor:pointer;font-family:inherit}
-.btn-print:hover{background:var(--s2);color:var(--text)}
 .banner{background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:12px 16px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:flex-start;gap:14px;font-size:12px}
 .banner h4{font-size:13px;font-weight:700;color:#9a3412;margin-bottom:3px}
 .banner p{color:#7c2d12}
@@ -2004,13 +1959,6 @@ button{padding:8px 20px;border-radius:6px;font-size:13px;cursor:pointer;border:n
 .loading{text-align:center;padding:60px 0;color:var(--muted);font-size:14px}.hidden{display:none}
 .footer{text-align:center;padding:24px 0;font-size:11px;color:var(--dim)}.footer a{color:var(--accent);text-decoration:none}.footer code{background:var(--s2);padding:1px 5px;border-radius:3px;font-size:10px}
 
-@media print{
-  .controls,.header-actions,.banner button,.session-link,.modal-bg,.btn-print,.toggle{display:none!important}
-  .wrap{max-width:none;padding:8px}
-  .panel{break-inside:avoid;page-break-inside:avoid}
-  body{background:#fff}
-  .hero{box-shadow:none;background:#f8f9fc}
-}
 @media(max-width:900px){.tri-cols{grid-template-columns:1fr};.hero-stats{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:800px){.cards{grid-template-columns:repeat(2,1fr)}.cols{grid-template-columns:1fr}}
 </style>
@@ -2021,9 +1969,6 @@ button{padding:8px 20px;border-radius:6px;font-size:13px;cursor:pointer;border:n
     <div><h1>Claude Code Mirror</h1><p>How you actually use Claude Code. Local-only, no data leaves your machine.</p></div>
     <div class="header-actions">
       <button id="bannerChip" class="banner-chip hidden" onclick="toggleBannerExpand()" title="API-equivalent cost — what about Pro/Max?">Pro / Max?</button>
-      <button class="btn-print" onclick="downloadShareCard()" title="Download a 1200×628 share card image">Share card</button>
-      <label class="toggle" id="privacyToggle"><input type="checkbox" id="privacy"> Privacy mode</label>
-      <button class="btn-print" onclick="window.print()">Print / PDF</button>
     </div>
   </div></div>
   <div id="banner" class="hidden"></div>
@@ -2048,15 +1993,8 @@ button{padding:8px 20px;border-radius:6px;font-size:13px;cursor:pointer;border:n
 </div>
 <script>
 const $=s=>document.querySelector(s);let AV=null;
-const PRIVACY_KEY='cc-analyzer-privacy';
-const BANNER_KEY='cc-analyzer-banner-dismissed';
-
-function isPrivacy(){return localStorage.getItem(PRIVACY_KEY)==='1'}
-function setPrivacy(v){localStorage.setItem(PRIVACY_KEY, v?'1':'0');$('#privacy').checked=v;document.getElementById('privacyToggle').classList.toggle('on',v);run()}
-$('#privacy').addEventListener('change',e=>setPrivacy(e.target.checked));
 
 async function init(){
-  $('#privacy').checked=isPrivacy();document.getElementById('privacyToggle').classList.toggle('on',isPrivacy());
   try{const r=await fetch('/api/availability');AV=await r.json();
     if(!AV.first_date){$('#avail').innerHTML='No Claude Code session logs found in <code>~/.claude/projects/</code>. Use Claude Code first, then come back.';return}
     const n=AV.active_dates.length;const span=Math.round((new Date(AV.last_date)-new Date(AV.first_date))/864e5)+1;
@@ -2074,7 +2012,7 @@ async function run(){
   const from=$('#df').value,to=$('#dt').value;if(!from||!to)return;
   CATEGORY_FILTER=null;  // reset when re-running with new dates
   $('#status').textContent='Scanning...';$('#loading').classList.remove('hidden');$('#loading').textContent='Analyzing sessions...';$('#dash').classList.add('hidden');
-  try{const url=`/api/analyze?from=${from}&to=${to}${isPrivacy()?'&privacy=1':''}`;
+  try{const url=`/api/analyze?from=${from}&to=${to}`;
     const r=await fetch(url);const d=await r.json();
     if(d.error){$('#loading').textContent=d.error;$('#status').textContent='';return}
     render(d);$('#dash').classList.remove('hidden');$('#loading').classList.add('hidden');$('#status').textContent=d.summary.sessions+' sessions';
@@ -2507,7 +2445,7 @@ async function openSession(sid){
   mb.classList.add('open');
   m.innerHTML='<button class="modal-close" onclick="closeModal()">×</button><p>Loading session…</p>';
   try{
-    const r=await fetch(`/api/session/${encodeURIComponent(sid)}${isPrivacy()?'?privacy=1':''}`);
+    const r=await fetch(`/api/session/${encodeURIComponent(sid)}`);
     const d=await r.json();
     if(d.error){m.innerHTML=`<button class="modal-close" onclick="closeModal()">×</button><p>${escHtml(d.error)}</p>`;return}
     renderModal(d);
@@ -2551,77 +2489,6 @@ function renderModal(d){
   m.innerHTML=h;
 }
 
-// ── Share card (1200×628 PNG, drawn client-side via Canvas) ──
-// Made for LinkedIn/Twitter share images. Uses cached LAST_DATA so it
-// reflects the currently-visible window. Respects privacy mode by drawing
-// only aggregate numbers — no session labels or paths.
-function downloadShareCard(){
-  if(!LAST_DATA){alert('Analyze a window first, then click Share card.');return}
-  const d=LAST_DATA,s=d.summary,e=d.efficiency,sc_=d.scores,tf=d.top_finding;
-  const W=1200,H=628;
-  const c=document.createElement('canvas');c.width=W;c.height=H;
-  const x=c.getContext('2d');
-  // Background gradient (matches hero)
-  const g=x.createLinearGradient(0,0,W,H);g.addColorStop(0,'#eef2ff');g.addColorStop(1,'#f5f3ff');
-  x.fillStyle=g;x.fillRect(0,0,W,H);
-  // Subtle grid border
-  x.strokeStyle='#c7d2fe';x.lineWidth=2;x.strokeRect(1,1,W-2,H-2);
-  // Title bar
-  x.fillStyle='#1a1d2b';x.font='600 22px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
-  x.fillText('Claude Code Mirror',56,68);
-  x.fillStyle='#6b7085';x.font='400 14px -apple-system,sans-serif';
-  x.fillText('How you actually use Claude Code · github.com/akshatk7/claude-efficiency-analyzer',56,92);
-  // Headline (top finding or fallback hero headline)
-  const headline=tf?tf.headline:(d.hero_headline||`${s.sessions} sessions over ${d.period.active_days} active days`);
-  x.fillStyle='#1a1d2b';x.font='700 38px -apple-system,sans-serif';
-  wrapText(x,headline,56,170,W-112,46);
-  // Action sub-line
-  if(tf){
-    x.fillStyle='#3730a3';x.font='500 18px -apple-system,sans-serif';
-    wrapText(x,'→ '+tf.action,56,290,W-112,26);
-  }
-  // 4 stat tiles
-  const tiles=[
-    {v:fmtMoney(s.total_cost),l:'PERIOD SPEND',s:'~'+fmtMoney(e.projected_monthly)+'/mo'},
-    {v:s.total_hours+'h',l:'ACTIVE HOURS',s:s.sessions+' sessions'},
-    {v:Math.round(e.cache_hit_rate*100)+'%',l:'CACHE REUSE',s:fmtNum(s.total_tokens)+' tokens'},
-    {v:d.period.active_days+'/'+d.period.days,l:'DAYS ACTIVE',s:''},
-  ];
-  const tileW=(W-112-3*16)/4,tileH=130,tileY=420;
-  tiles.forEach((t,i)=>{
-    const tx=56+i*(tileW+16);
-    x.fillStyle='#fff';x.strokeStyle='#c7d2fe';x.lineWidth=1;
-    roundRect(x,tx,tileY,tileW,tileH,12);x.fill();x.stroke();
-    x.fillStyle='#1a1d2b';x.font='800 32px -apple-system,sans-serif';
-    x.fillText(t.v,tx+18,tileY+50);
-    x.fillStyle='#6b7085';x.font='600 11px -apple-system,sans-serif';
-    x.fillText(t.l,tx+18,tileY+78);
-    x.fillStyle='#9298b0';x.font='400 12px -apple-system,sans-serif';
-    x.fillText(t.s,tx+18,tileY+100);
-  });
-  // Footer disclaimer
-  x.fillStyle='#9298b0';x.font='400 11px -apple-system,sans-serif';
-  x.fillText('Numbers are API-equivalent cost. Pro/Max plans are flat-fee. Generated locally — no data uploaded.',56,H-30);
-  // Download
-  c.toBlob(blob=>{
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement('a');a.href=url;a.download='claude-code-mirror.png';a.click();
-    setTimeout(()=>URL.revokeObjectURL(url),1000);
-  },'image/png');
-}
-function wrapText(ctx,text,x,y,maxW,lineH){
-  const words=String(text).split(/\s+/);let line='',ly=y;
-  for(const w of words){
-    const test=line?line+' '+w:w;
-    if(ctx.measureText(test).width>maxW&&line){ctx.fillText(line,x,ly);line=w;ly+=lineH}
-    else{line=test}
-  }
-  if(line)ctx.fillText(line,x,ly);
-}
-function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath()}
-function fmtMoney(n){return n>=1?'$'+n.toFixed(0):'$'+n.toFixed(2)}
-function fmtNum(n){return n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(Math.round(n))}
-
 init();
 </script>
 </body>
@@ -2632,12 +2499,10 @@ init();
 
 class Handler(BaseHTTPRequestHandler):
     all_sessions = []
-    default_privacy = False
 
     def do_GET(self):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
-        privacy = (qs.get("privacy", ["0"])[0] == "1") or Handler.default_privacy
 
         if parsed.path == "/api/availability":
             self._json(scan_availability(Handler.all_sessions))
@@ -2657,35 +2522,18 @@ class Handler(BaseHTTPRequestHandler):
                     df = dt - timedelta(days=days - 1)
                 else:
                     df = dt = datetime.fromisoformat(_today()).date()
-            data = analyze(Handler.all_sessions, df, dt)
-            if privacy and "error" not in data:
-                data = self._redact(data)
-            self._json(data)
+            self._json(analyze(Handler.all_sessions, df, dt))
             return
 
         if parsed.path.startswith("/api/session/"):
             sid = parsed.path.rsplit("/", 1)[-1]
-            data = session_detail(Handler.all_sessions, sid)
-            if privacy and "error" not in data:
-                data = self._redact(data)
-            self._json(data)
+            self._json(session_detail(Handler.all_sessions, sid))
             return
 
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
         self.wfile.write(DASHBOARD_HTML.encode())
-
-    def _redact(self, data):
-        # Build stable aliases for project paths and session IDs.
-        project_aliases, session_aliases = {}, {}
-        for i, s in enumerate(Handler.all_sessions):
-            if s.get("project_dir") and s["project_dir"] not in project_aliases:
-                project_aliases[s["project_dir"]] = f"project-{chr(65 + len(project_aliases) % 26)}"
-            sid = s.get("session_id")
-            if sid and sid not in session_aliases:
-                session_aliases[sid] = f"session-{_hash_label(sid, 4)}"
-        return redact_obj(data, project_aliases, session_aliases)
 
     def _json(self, data):
         self.send_response(200)
@@ -2716,7 +2564,6 @@ def main():
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--export", metavar="OUT.json", help="Write report JSON for the period and exit")
     parser.add_argument("--days", type=int, default=30, help="Days for --export (default 30)")
-    parser.add_argument("--privacy", action="store_true", help="Default to privacy mode (redact paths/IDs)")
     parser.add_argument("--demo", nargs='?', const='solo-dev', default=None,
                         metavar="PERSONA",
                         help="Use synthetic demo data instead of your local logs. "
@@ -2743,22 +2590,12 @@ def main():
         last = datetime.fromisoformat(avail["last_date"]).date()
         first = last - timedelta(days=args.days - 1)
         report = analyze(all_sessions, first, last)
-        if args.privacy and "error" not in report:
-            project_aliases, session_aliases = {}, {}
-            for s in all_sessions:
-                if s.get("project_dir") and s["project_dir"] not in project_aliases:
-                    project_aliases[s["project_dir"]] = f"project-{chr(65 + len(project_aliases) % 26)}"
-                sid = s.get("session_id")
-                if sid and sid not in session_aliases:
-                    session_aliases[sid] = f"session-{_hash_label(sid, 4)}"
-            report = redact_obj(report, project_aliases, session_aliases)
         with open(args.export, "w") as f:
             json.dump(report, f, default=_json_default, indent=2)
         print(f"Wrote {args.export} ({first} → {last})")
         return
 
     Handler.all_sessions = all_sessions
-    Handler.default_privacy = args.privacy
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://localhost:{args.port}"
     print(f"Claude Code Mirror running at {url}")

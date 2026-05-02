@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.5.1 — 2026-05-02
+
+Simplification pass — removed three header buttons that added UI surface
+without adding much value. The dashboard is for understanding usage, not
+for sharing/exporting/printing it.
+
+### Removed: Share card, Privacy mode, Print/PDF
+
+- Three header buttons gone: **Share card** (just-added in v1.5.0),
+  **Privacy mode** toggle, and **Print / PDF** button
+- Header is now just the title + a small "Pro / Max?" chip
+- `--privacy` CLI flag removed
+- Server-side `redact_obj()`, `_redact()`, `_hash_label()`, `?privacy=1`
+  query param all gone
+- `@media print` stylesheet and `.btn-print`/`.toggle` CSS classes removed
+- Net: ~165 lines removed, no behavior change for the panels themselves
+
+If you want to share a screenshot, use your OS screenshot tool. If you want
+to scrub paths before sharing, edit the PNG. The dashboard's job is to show
+you your usage; sharing it is your job.
+
 ## v1.5.0 — 2026-05-02
 
 Generalization pass — the tool was originally built inside one company and

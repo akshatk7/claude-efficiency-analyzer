@@ -64,19 +64,9 @@ This loads ~85 synthetic sessions across 32 days — realistic distributions, de
 
 Every session label and Top 10 row is clickable. The drill-down modal shows: project, category, total cost, cost split by token type, top tools, the first prompt, any flags raised, and a turn-by-turn cost table.
 
-## Privacy Mode
+## JSON Export
 
-A toggle in the header redacts paths, usernames, and session IDs to stable aliases. Useful before sharing a screenshot externally. Note: free-text content (first prompts, session labels) is *not* automatically redacted — those can contain anything.
-
-```bash
-python3 analyzer.py --privacy   # default to privacy mode on launch
-```
-
-## Print / Export PDF
-
-Use the **Print / PDF** button in the header (or your browser's print menu). The print stylesheet hides controls, modals, and the footer.
-
-For a machine-readable export:
+For a machine-readable report (useful for scripting or comparing periods):
 
 ```bash
 python3 analyzer.py --export report.json --days 30
@@ -135,10 +125,6 @@ The 1M context window is now standard pricing — no surcharge — for Opus 4.6+
 
 These are API rates. Enterprise plans may have different negotiated rates. Pro and Max plans are flat-fee — cost numbers shown are equivalent API cost, not your actual bill.
 
-## Share card
-
-Click **Share card** in the header to download a 1200×628 PNG with the headline, top action, and four key numbers. Sized for LinkedIn / Twitter. Numbers reflect the currently-visible date window.
-
 ## Options
 
 ```bash
@@ -148,10 +134,8 @@ python3 analyzer.py --no-open          # don't auto-open browser
 python3 analyzer.py --demo             # synthetic data preview (solo-dev default)
 python3 analyzer.py --demo pm          # PM persona
 python3 analyzer.py --demo writer      # writer/researcher persona
-python3 analyzer.py --privacy          # default to privacy mode (redact paths/IDs)
 python3 analyzer.py --export OUT.json  # write report JSON for last 30d and exit
 python3 analyzer.py --export OUT.json --days 7  # custom window
-python3 analyzer.py --export OUT.json --privacy # export with redaction applied
 ```
 
 Scripting the API directly:
