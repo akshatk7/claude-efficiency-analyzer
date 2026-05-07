@@ -2225,11 +2225,11 @@ function al(color,label,count,p){return`<div style="display:flex;align-items:fle
 // ── Categories ──
 function renderCategories(cats){
   if(!cats||!cats.length||cats.length===1)return'';
-  let h='<div class="panel" style="margin-bottom:20px"><h3>What you used Claude Code for</h3><p class="panel-sub">Click a category to filter the Top 10 turns table below</p>';
+  let h='<div class="panel" style="margin-bottom:20px"><h3>What you used Claude Code for</h3><p class="panel-sub">Sessions auto-categorized by intent</p>';
   const mx=cats[0].cost;
   for(const c of cats){
     const w=mx>0?Math.max((c.cost/mx)*100,3):0;
-    h+=`<div class="br" style="cursor:pointer" onclick="filterTurnsByCategory('${escHtml(c.name)}')"><div class="bl"><span class="cat-pill ${catClass(c.name)}">${escHtml(c.name)}</span></div><div class="bt"><div class="bf" style="width:${w}%;background:var(--accent)">${w>20?fC(c.cost):''}</div></div><div class="bv">${c.sessions} sess · ${fC(c.cost)}</div></div>`;
+    h+=`<div class="br"><div class="bl"><span class="cat-pill ${catClass(c.name)}">${escHtml(c.name)}</span></div><div class="bt"><div class="bf" style="width:${w}%;background:var(--accent)">${w>20?fC(c.cost):''}</div></div><div class="bv">${c.sessions} sess · ${fC(c.cost)}</div></div>`;
   }
   return h+'</div>';
 }

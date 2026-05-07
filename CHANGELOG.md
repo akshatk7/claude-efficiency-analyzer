@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.7.1 — 2026-05-07
+
+Open-source readiness pass: shorter README, fresh screenshot, dead
+click handler removed.
+
+- README cut roughly in half (168 → 60 lines). Removed the long
+  feature catalog, pricing table, Drill-Down section, and detailed
+  data-availability prose. The audience this README serves is split
+  between humans deciding whether to clone and another Claude reading
+  it to run the tool for its user — both want a short, scannable doc.
+- Removed three stale feature mentions that referenced panels cut in
+  v1.7.0 (Top 10 expensive turns, External services, Compared to
+  prior period).
+- Refreshed `screenshot.png` to show the v1.7.0 dashboard (new cache
+  callout, three cut panels gone, current product name).
+- Removed dead click handler on category pills in "What you used
+  Claude Code for." The handler used to filter the (now-cut) Top 10
+  turns table; clicking did nothing visible. Pills are now
+  non-interactive labels with a clearer subtitle ("Sessions
+  auto-categorized by intent").
+
 ## v1.7.0 — 2026-05-07
 
 Sharper messaging on the cache aha + cut three panels that didn't pull
