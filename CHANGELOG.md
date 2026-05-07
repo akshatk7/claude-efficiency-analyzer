@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.6.0 — 2026-05-06
+
+Reverted the v1.5.0 rename. Back to **Claude Code Efficiency Analyzer**.
+
+### Why
+
+"Mirror" reads as a tagline, not a label — it doesn't tell a stranger
+what the tool does. The original name is what people actually search for
+("claude code cost analysis", "claude usage analyzer"), and it matches
+the repo URL, which never moved. The "efficiency implies use less"
+worry was self-imposed; the tool's positioning is set by the README copy
+and screenshot, not the title.
+
+### Changed
+
+- README h1, page `<title>`, dashboard h1, argparse description, and
+  startup banner all back to **Claude Code Efficiency Analyzer**
+- No code or behavior changes. Categorization, demo personas, subagent
+  fix, and the v1.5.1 simplification all stay as-is.
+
 ## v1.5.1 — 2026-05-02
 
 Simplification pass — removed three header buttons that added UI surface

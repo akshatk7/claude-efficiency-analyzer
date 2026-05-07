@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Code Mirror
+Claude Code Efficiency Analyzer
 Reads your local Claude Code session logs and shows you how you actually use the tool —
 spending, token distribution, where context bloats, and where to focus.
 
@@ -1834,7 +1834,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Code Mirror</title>
+<title>Claude Code Efficiency Analyzer</title>
 <style>
 :root{--bg:#f5f6f8;--s1:#fff;--s2:#f0f1f4;--s3:#e5e7ee;--border:#dde0e8;--text:#1a1d2b;--muted:#6b7085;--dim:#9298b0;--accent:#6366f1;--green:#16a34a;--green-dim:rgba(22,163,74,.08);--yellow:#ca8a04;--yellow-dim:rgba(202,138,4,.08);--orange:#ea580c;--orange-dim:rgba(234,88,12,.08);--red:#dc2626;--blue:#2563eb;--blue-dim:rgba(37,99,235,.07);--purple:#a855f7}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1966,7 +1966,7 @@ button{padding:8px 20px;border-radius:6px;font-size:13px;cursor:pointer;border:n
 <body>
 <div class="wrap">
   <div class="header"><div class="header-row">
-    <div><h1>Claude Code Mirror</h1><p>How you actually use Claude Code. Local-only, no data leaves your machine.</p></div>
+    <div><h1>Claude Code Efficiency Analyzer</h1><p>How you actually use Claude Code. Local-only, no data leaves your machine.</p></div>
     <div class="header-actions">
       <button id="bannerChip" class="banner-chip hidden" onclick="toggleBannerExpand()" title="API-equivalent cost — what about Pro/Max?">Pro / Max?</button>
     </div>
@@ -2559,7 +2559,7 @@ def _today():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Claude Code Mirror — how you actually use Claude Code")
+    parser = argparse.ArgumentParser(description="Claude Code Efficiency Analyzer — how you actually use Claude Code")
     parser.add_argument("--port", type=int, default=8741)
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--export", metavar="OUT.json", help="Write report JSON for the period and exit")
@@ -2598,7 +2598,7 @@ def main():
     Handler.all_sessions = all_sessions
     server = HTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://localhost:{args.port}"
-    print(f"Claude Code Mirror running at {url}")
+    print(f"Claude Code Efficiency Analyzer running at {url}")
     print("Press Ctrl+C to stop.\n")
     if not args.no_open:
         webbrowser.open(url)

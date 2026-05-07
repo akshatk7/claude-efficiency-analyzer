@@ -1,4 +1,4 @@
-# Claude Code Mirror
+# Claude Code Efficiency Analyzer
 
 A single-file tool that reads your local Claude Code session logs and shows you how you actually use the tool — spending, token distribution, where context bloats, and one concrete next action. Built for people leaning in on AI, not throttling back. No API keys, no dependencies, no data leaves your machine.
 
