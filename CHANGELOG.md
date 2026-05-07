@@ -1,5 +1,54 @@
 # Changelog
 
+## v1.7.0 — 2026-05-07
+
+Sharper messaging on the cache aha + cut three panels that didn't pull
+their weight + fix a categorization bug where intent lost to shape.
+
+### "Where the money went" rewritten
+
+The cache-cost insight is the load-bearing reason this tool exists, but
+the explanation was hidden behind a `<details>` toggle. Most readers never
+clicked it, so the dashboard left them confused: cache hit rate of 96%
+appeared "good," yet ~80% of spend in cache appeared "bad," and the
+relationship between those two numbers was opaque.
+
+- Lead callout, always visible: dollar amount + % of spend that went to
+  re-reading conversation history, with a one-paragraph plain-English
+  explanation of why
+- Resolves the cache-hit-rate vs. cache-spend-share confusion: "the cache
+  is doing its job; cost is high because your sessions are long"
+- Includes the actual lever (`/clear` between topics) inline, not buried
+- Avg messages per session quoted directly so the user sees the
+  multiplier: "by turn 118, Claude is rereading turns 1 through 117"
+
+### Removed three panels
+
+- **Top 10 most expensive turns.** Top 10 sums to ~$1 for typical users.
+  Not actionable, just trivia.
+- **External services** (MCP token cost). For non-MCP-heavy users, total
+  is ~$5 of $250. Misleading by emphasis.
+- **"Compared to prior period."** Confusing phrasing ("clean sessions vs
+  prior period"), dim utility, doesn't drive an action.
+
+(Functions left in place for now; only the call sites are removed. Easy
+to bring back if the cuts prove wrong.)
+
+### Categorization bug fix
+
+`categorize_session` was running the shape-based "Coding" rule
+(`write_n >= 5`) before the keyword-based intent check. Result: any
+session where Claude edited 5+ files got bucketed as Coding regardless
+of what the user actually asked for. Newsletter drafting, dossier
+research, JSX carousel work all read as Coding because each touched
+many markdown / JSX files.
+
+- Reordered: keyword check (intent) now runs before shape rules
+- Sessions with first prompts containing "newsletter," "draft,"
+  "research," etc. now correctly route to Writing / Research / etc.
+- Categorization is still imperfect when the first prompt has no clear
+  intent keyword — that's a v1.7.1 problem (file-extension tracking)
+
 ## v1.6.0 — 2026-05-06
 
 Reverted the v1.5.0 rename. Back to **Claude Code Efficiency Analyzer**.

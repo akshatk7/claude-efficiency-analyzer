@@ -318,7 +318,8 @@ def categorize_session(session, first_prompt):
     read_n = session["reads"]
     mcp_n = session["mcp_calls"]
 
-    # Strong MCP-tool-based signals — fire when a specialized server dominates.
+    # Strong MCP-tool signals fire first — a specialized server dominating
+    # the session is unambiguous (e.g. Snowflake = data, Figma = design).
     data_n = _count_mcp_matches(tools, CATEGORY_MCP_PATTERNS["Data Analysis"])
     design_n = _count_mcp_matches(tools, CATEGORY_MCP_PATTERNS["Design Work"])
     pm_n = _count_mcp_matches(tools, CATEGORY_MCP_PATTERNS["PM Work"])
@@ -331,15 +332,17 @@ def categorize_session(session, first_prompt):
         return "Design Work"
     if pm_n >= 2 or comm_n >= 5 or knowledge_n >= 5:
         return "PM Work"
-    if write_n >= 5 and (read_n / max(write_n, 1)) <= 5 and mcp_n < 5:
-        return "Coding"
 
-    # Keyword-based fallbacks
+    # Intent (the user's first prompt) beats shape (tool counts). A session
+    # that says "draft the newsletter" or "research X" is Writing/Research
+    # even if Claude wrote 10 markdown files in the process.
     for cat, keywords in CATEGORY_KEYWORDS.items():
         if any(k in text for k in keywords):
             return cat
 
-    # Final shape-based fallbacks
+    # Shape-based fallbacks for sessions with no clear intent keyword.
+    if write_n >= 5 and (read_n / max(write_n, 1)) <= 5 and mcp_n < 5:
+        return "Coding"
     if knowledge_n >= 2 or (read_n >= 5 and write_n == 0):
         return "Research"
     if write_n >= 3:
@@ -2125,12 +2128,30 @@ function renderRecs(R){
 }
 
 // ── Money ──
-function renderMoney(cb){
+function renderMoney(d){
+  const cb=d.cost_breakdown||{};
+  const eff=d.efficiency||{};
   const cw=(cb.cache_write_5m||0)+(cb.cache_write_1h||0);
   const total=(cb.input||0)+(cb.output||0)+(cb.cache_read||0)+cw+(cb.web_search||0);
   if(total<=0)return'';
   const pI=(cb.input/total)*100,pO=(cb.output/total)*100,pCR=(cb.cache_read/total)*100,pCW=(cw/total)*100,pWS=((cb.web_search||0)/total)*100;
-  let h='<div class="panel" style="margin-bottom:20px"><h3>Where the money goes</h3><p class="panel-sub">Cost split by token type</p>';
+  const cacheTotal=(cb.cache_read||0)+cw;
+  const cachePct=pCR+pCW;
+  const hitPct=((eff.cache_hit_rate||0)*100).toFixed(0);
+  const avgMsgs=Math.round(eff.msgs_per_session||0);
+
+  let h='<div class="panel" style="margin-bottom:20px"><h3>Where the money went</h3>';
+
+  // Lead with the aha if cache dominates spend (which is true for nearly all real users).
+  if(cachePct>50){
+    h+=`<div style="background:var(--blue-dim);border-left:3px solid var(--blue);padding:14px 16px;border-radius:6px;margin-bottom:18px">`;
+    h+=`<div style="font-size:17px;font-weight:600;line-height:1.4;margin-bottom:8px">${fC(cacheTotal)} of ${fC(total)} (${cachePct.toFixed(0)}%) went to re-reading your conversation history.</div>`;
+    h+=`<p style="font-size:13px;line-height:1.55;color:var(--ink);margin:0">Every Claude Code turn re-loads the entire conversation: every prior message, file, and tool result. Your sessions average <strong>${avgMsgs} messages</strong>, so by turn ${avgMsgs} Claude is rereading turns 1 through ${Math.max(avgMsgs-1,1)}. The cache itself is doing its job (<strong>${hitPct}% hit rate</strong> means 96 of every 100 input tokens are reused, not freshly typed). Cache <em>cost</em> is high because your sessions are long, not because anything is broken.</p>`;
+    h+=`<p style="font-size:13px;line-height:1.55;color:var(--ink);margin:8px 0 0"><strong>The lever:</strong> Use <code>/clear</code> when you switch tasks mid-session, or start a fresh session for unrelated work. Shorter sessions, less re-reading.</p>`;
+    h+='</div>';
+  }
+
+  h+='<p class="panel-sub" style="margin-bottom:8px">Full split by token type</p>';
   h+='<div style="display:flex;height:32px;border-radius:6px;overflow:hidden;margin-bottom:16px">';
   if(pCR>1)h+=`<div style="width:${pCR}%;background:#3b82f6;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Cache reads: ${fC(cb.cache_read)}">${pCR>8?'Cache reads':''}</div>`;
   if(pCW>1)h+=`<div style="width:${pCW}%;background:#f97316;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff" title="Cache writes: ${fC(cw)}">${pCW>8?'Cache writes':''}</div>`;
@@ -2144,10 +2165,6 @@ function renderMoney(cb){
   h+=cl('#6366f1','Input',cb.input,pI,'Your prompts and instructions');
   if((cb.web_search||0)>0)h+=cl('#a855f7','Web search',cb.web_search,pWS,'$10 per 1,000 web_search calls');
   h+='</div>';
-  const cachePct=pCR+pCW;
-  if(cachePct>70){
-    h+=`<details style="margin-top:14px"><summary style="cursor:pointer;font-size:12px;color:var(--blue);font-weight:600">Why is ${cachePct.toFixed(0)}% of your spend in cache? &nbsp;<span style="color:var(--dim);font-weight:400">(click to expand)</span></summary><div class="rec rec-info" style="margin-top:8px"><p>Every message, Claude re-reads the <strong>entire conversation history</strong> — every prior turn, every file read, every tool result. The 1M context window (now standard pricing on Opus 4.6+ and Sonnet 4.6+) lets sessions grow long, and cost compounds with each new turn.</p><p style="margin-top:6px"><strong>Lever:</strong> Use <code>/clear</code> mid-session when you switch tasks. Start fresh sessions for unrelated work.</p></div></details>`;
-  }
   return h+'</div>';
 }
 
@@ -2421,18 +2438,16 @@ function render(d){
   h+=renderTargets(d.targets);
   h+=renderRecs(d.recs||{});
   h+='<div class="section-h">Where the money went</div>';
-  h+=renderMoney(d.cost_breakdown||{});
-  h+='<div class="cols">'+renderModels(d)+renderExternal(d.session_health||{})+'</div>';
+  h+=renderMoney(d);
+  h+=renderModels(d);
   if(d.best_moments&&d.best_moments.length){h+='<div class="section-h">Highlights</div>';h+=renderBest(d.best_moments)}
   h+='<div class="section-h">How Claude Code got used</div>';
   h+='<div class="cols">'+renderActivity(d)+renderCategories(d.categories)+'</div>';
-  h+=renderTopTurns(d.top_turns||[]);
   h+=renderBloat(d.bloat_curves||[]);
   h+=renderDaily(d.daily||[]);
   h+=renderProjects(d.projects||[]);
   h+='<div class="section-h">Diagnostics</div>';
   h+=renderHealth(d.summary,d.session_health||{});
-  h+=renderTrend(d.trend);
   h+='<div class="section-h">Score detail</div>';
   h+=renderScore(d.scores,d.efficiency);
   $('#dash').innerHTML=h;
