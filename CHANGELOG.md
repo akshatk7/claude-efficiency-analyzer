@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.8.0 — 2026-05-08
+
+Added a small workflow quality layer alongside the cost/efficiency view.
+The cost view stays primary; this is a supporting panel at the bottom.
+
+- Renamed the bottom section from "Diagnostics" to "Workflow quality"
+  and the panel from "Session health signals" to "Workflow quality
+  signals." Sub-text now states explicitly: this is how sessions ran,
+  not a measure of output quality.
+- Core signals (Plan mode, Skills run, Redundant reads) now always
+  render, including at zero. Zero is often the actual signal — e.g.,
+  "0 skill invocations across 24 sessions" is a more useful prompt
+  than hiding the metric.
+- New "Most common patterns" pill row surfaces the top three flag
+  types across flagged sessions (e.g., "Heavy reading, no edits ×13",
+  "High interrupts ×4"), giving a quick read on where workflow
+  friction clusters without needing to drill into each session.
+- Backend exports a `top_flags` aggregation under `session_health` for
+  the JSON export, with friendly labels in the UI.
+
 ## v1.7.1 — 2026-05-07
 
 Open-source readiness pass: shorter README, fresh screenshot, dead

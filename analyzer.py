@@ -1420,6 +1420,10 @@ def analyze(all_sessions, date_from, date_to):
                 [(k, sum(s["skills_used"].get(k, 0) for s in sessions))
                  for k in {k for s in sessions for k in s["skills_used"].keys()}],
                 key=lambda x: -x[1])[:5],
+            "top_flags": sorted(
+                [(flag, sum(1 for s in sessions if flag in s.get("flags", [])))
+                 for flag in {f for s in sessions for f in s.get("flags", [])}],
+                key=lambda x: -x[1])[:3],
             "plan_mode_uses": sum(s["plan_mode_uses"] for s in sessions),
             "truncated_turns": sum(s["truncated_turns"] for s in sessions),
             "stale_context_sessions": stale_n,
@@ -2356,20 +2360,26 @@ function renderDaily(daily){
 }
 
 // ── Health ──
+const FLAG_LABELS={'bulk-read-no-output':'Heavy reading, no edits','mcp-heavy':'MCP-heavy','low-interaction':'Low interaction','high-interrupts':'High interrupts','deep-agent-loop':'Deep agent loop','redundant-reads':'Redundant file reads','stale-context':'Stale context','truncated-output':'Truncated output'};
 function renderHealth(s,sh){
-  if(!sh.flagged_count&&!sh.skill_invocations&&!sh.plan_mode_uses&&!sh.truncated_turns)return'';
-  let h='<div class="panel" style="margin-bottom:20px"><h3>Session health signals</h3><p class="panel-sub">Useful counts for sanity-checking your usage</p>';
+  let h='<div class="panel" style="margin-bottom:20px"><h3>Workflow quality signals</h3><p class="panel-sub">How sessions ran — clean, interrupted, scattered. Not a measure of output quality, just of how Claude Code got used.</p>';
   h+='<div style="display:flex;gap:18px;margin-bottom:8px;flex-wrap:wrap">';
   h+=ms('Clean sessions',sh.clean_pct+'%',sh.clean_pct>=90?'var(--green)':sh.clean_pct>=70?'var(--blue)':'var(--yellow)');
   h+=ms('Flagged',sh.flagged_count+' / '+s.sessions,sh.flagged_count<=2?'var(--green)':sh.flagged_count<=5?'var(--blue)':'var(--yellow)');
   h+=ms('Interrupts',String(sh.total_interrupts),sh.total_interrupts<=5?'var(--green)':sh.total_interrupts<=15?'var(--blue)':'var(--yellow)');
-  if(sh.truncated_turns>0)h+=ms('Truncated',String(sh.truncated_turns),sh.truncated_turns<=2?'var(--green)':sh.truncated_turns<=10?'var(--blue)':'var(--orange)');
-  if(sh.plan_mode_uses>0)h+=ms('Plan mode',String(sh.plan_mode_uses),'var(--green)');
-  if(sh.skill_invocations>0)h+=ms('Skills run',String(sh.skill_invocations),'var(--blue)');
+  h+=ms('Redundant reads',String(sh.redundant_reads||0),(sh.redundant_reads||0)<=2?'var(--green)':(sh.redundant_reads||0)<=10?'var(--blue)':'var(--yellow)');
+  h+=ms('Plan mode',String(sh.plan_mode_uses||0),(sh.plan_mode_uses||0)>0?'var(--green)':'var(--dim)');
+  h+=ms('Skills run',String(sh.skill_invocations||0),(sh.skill_invocations||0)>0?'var(--blue)':'var(--dim)');
   if(sh.subagent_spawns>0)h+=ms('Subagents',String(sh.subagent_spawns),'var(--blue)');
+  if(sh.truncated_turns>0)h+=ms('Truncated',String(sh.truncated_turns),sh.truncated_turns<=2?'var(--green)':sh.truncated_turns<=10?'var(--blue)':'var(--orange)');
   h+='</div>';
+  if(sh.top_flags&&sh.top_flags.length){
+    h+='<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)">Most common patterns: ';
+    h+=sh.top_flags.map(([n,c])=>`<span class="cat-pill" style="background:var(--yellow-dim,rgba(234,179,8,0.15));color:var(--yellow);margin-right:4px">${escHtml(FLAG_LABELS[n]||n)} ×${c}</span>`).join('');
+    h+='</div>';
+  }
   if(sh.top_skills&&sh.top_skills.length){
-    h+='<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)">Top skills: ';
+    h+='<div style="margin-top:8px;font-size:11px;color:var(--muted)">Top skills: ';
     h+=sh.top_skills.map(([n,c])=>`<span class="cat-pill" style="background:var(--blue-dim);color:var(--blue);margin-right:4px">${escHtml(n)} ×${c}</span>`).join('');
     h+='</div>';
   }
@@ -2446,7 +2456,7 @@ function render(d){
   h+=renderBloat(d.bloat_curves||[]);
   h+=renderDaily(d.daily||[]);
   h+=renderProjects(d.projects||[]);
-  h+='<div class="section-h">Diagnostics</div>';
+  h+='<div class="section-h">Workflow quality</div>';
   h+=renderHealth(d.summary,d.session_health||{});
   h+='<div class="section-h">Score detail</div>';
   h+=renderScore(d.scores,d.efficiency);
